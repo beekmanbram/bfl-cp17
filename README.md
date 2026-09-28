@@ -33,6 +33,15 @@ The original electronics are replaced by:
 
 The display is used without touchscreen functionality.
 
+## 3D printed parts
+
+3D files are included for two printed plates that adapt the original JOBO enclosure:
+
+- **Bottom plate** — fits in the space where the original motherboard used to sit.
+- **Top plate** — fits the cutout made in the JOBO cover.
+
+Photos will be added later.
+
 ## Motor control
 
 The original 24 V drum motor is controlled by the DFR0601.
