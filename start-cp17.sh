@@ -21,7 +21,7 @@ done
 OUTPUT=$(DISPLAY=:0 xrandr --query | awk '/ connected/{print $1; exit}')
 
 if [ -n "$OUTPUT" ]; then
-    DISPLAY=:0 xrandr --output "$OUTPUT" --rotate left
+    DISPLAY=:0 xrandr --output "$OUTPUT" --rotate right
 fi
 
 DISPLAY=:0 xset s off

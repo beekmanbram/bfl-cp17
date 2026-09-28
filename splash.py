@@ -115,8 +115,8 @@ def prepare_display():
     raise SystemExit(1)
 
 
-def rotate_display_left():
-    """Same rotation as start-cp17.sh: portrait, HDMI turned left."""
+def rotate_display_right():
+    """Same rotation as start-cp17.sh: portrait, HDMI turned right."""
     env = os.environ.copy()
     env["DISPLAY"] = os.environ.get("DISPLAY", ":0")
     output = None
@@ -144,7 +144,7 @@ def rotate_display_left():
         return None
 
     subprocess.run(
-        ["xrandr", "--output", output, "--rotate", "left"],
+        ["xrandr", "--output", output, "--rotate", "right"],
         env=env,
         check=False,
     )
@@ -174,7 +174,7 @@ def rotate_display_left():
 
 
 prepare_display()
-rotated_size = rotate_display_left()
+rotated_size = rotate_display_right()
 
 try:
     root = tk.Tk()
