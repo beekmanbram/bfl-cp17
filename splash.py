@@ -7,6 +7,9 @@ BASE_DIR = "/home/cp17/bfl-cp17"
 LOGO = os.path.join(BASE_DIR, "assets", "logo.png")
 MAIN = os.path.join(BASE_DIR, "main.py")
 
+# Xorg from start-cp17.sh is on :0. sudo drops DISPLAY unless it is set here.
+os.environ.setdefault("DISPLAY", ":0")
+
 root = tk.Tk()
 
 root.configure(bg="black")
