@@ -2,7 +2,6 @@ import copy
 import json
 import os
 import shutil
-import subprocess
 import sys
 import threading
 import time
@@ -1956,14 +1955,16 @@ def close_app():
 
 
 def shutdown_pi():
-    close_app()
-    try:
-        subprocess.Popen(["shutdown", "-h", "now"])
-    except Exception:
-        try:
-            subprocess.Popen(["sudo", "-n", "shutdown", "-h", "now"])
-        except Exception:
-            pass
+    stop_all_activity()
+    for key in list(after_ids):
+        cancel_after(key)
+    close_hardware()
+
+    for path in ("/usr/sbin/shutdown", "/sbin/shutdown"):
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            os.execv(path, ["shutdown", "-h", "now"])
+
+    os.execvp("shutdown", ["shutdown", "-h", "now"])
 
 
 def attach_xauthority():
