@@ -2,6 +2,7 @@ import copy
 import json
 import os
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -1960,11 +1961,15 @@ def shutdown_pi():
         cancel_after(key)
     close_hardware()
 
-    for path in ("/usr/sbin/shutdown", "/sbin/shutdown"):
-        if os.path.isfile(path) and os.access(path, os.X_OK):
-            os.execv(path, ["shutdown", "-h", "now"])
-
-    os.execvp("shutdown", ["shutdown", "-h", "now"])
+    # Same command that powers the Pi off from a terminal.
+    # Do not replace this process: that ends the X session before shutdown runs.
+    subprocess.Popen(
+        ["sudo", "shutdown", "-h", "now"],
+        start_new_session=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
 
 
 def attach_xauthority():
