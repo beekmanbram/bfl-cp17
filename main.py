@@ -1,6 +1,7 @@
 import copy
 import json
 import os
+import shutil
 import sys
 import threading
 import time
@@ -13,7 +14,7 @@ except ImportError:
     pwd = None
 
 try:
-    from gpiozero import DigitalOutputDevice, DigitalInputDevice, Button
+    from gpiozero import Button, DigitalInputDevice, DigitalOutputDevice
     HAS_GPIO = True
 except ImportError:
     HAS_GPIO = False
@@ -24,63 +25,61 @@ except ImportError:
 # JOBO FILM PROCESSOR
 #
 # DFR0601
-# PWM1 -> GPIO12
-# INA1 -> GPIO6
-# INB1 -> GPIO13
+# PWM1 -> GPIO12  (physical 32)  hardware PWM 20 kHz
+# INA1 -> GPIO6   (physical 31)
+# INB1 -> GPIO13  (physical 33)
 #
-# ENCODER
-# A    -> GPIO16
-# B    -> GPIO20
+# Encoder, rotation only
+# A -> GPIO16
+# B -> GPIO20
+# GPIO21 is unused. The encoder push button is not used.
 #
-# KNOPPEN
-# OK    -> GPIO23
-# TERUG -> GPIO24
+# Separate buttons to GND, internal pull-up
+# OK   -> GPIO23
+# BACK -> GPIO24
 #
-# GPIO12 hardware PWM @ 20 kHz
+# DS18B20 DATA -> GPIO4
+# Screen 800x480, no touch
 # ============================================================
 
-
-# ============================================================
-# GPIO
-# ============================================================
 
 INA_GPIO = 6
 INB_GPIO = 13
-
 ENCODER_A_GPIO = 16
 ENCODER_B_GPIO = 20
+OK_GPIO = 23
+BACK_GPIO = 24
 
-EXTRA_OK_GPIO = 23
-EXTRA_BACK_GPIO = 24
-
-PWM_FREQUENCY = 20_000
 PWM_PERIOD_NS = 50_000
 PWM_CHANNEL = 0
-
-
-# ============================================================
-# GUI
-# ============================================================
 
 WIDTH = 800
 HEIGHT = 480
 
-BG = "#121212"
-TEXT = "#ffffff"
-MUTED = "#aaaaaa"
-
-BUTTON_BG = "#333333"
-
-GREEN = "#2e7d32"
-RED = "#b71c1c"
-BLUE = "#1565c0"
+BG = "#0d0d0d"
+TEXT = "#f2f2f2"
+MUTED = "#8a8a8a"
+ACCENT = "#e0a800"
+GREEN = "#7dcea0"
+RED = "#e06c6c"
 ORANGE = "#ef6c00"
-SELECT = "#ffd54f"
+TRACK = "#1c1c1c"
 
+FONT = "DejaVu Sans"
+MONO = "DejaVu Sans Mono"
 
-# ============================================================
-# DUMMY HARDWARE (desktop / zonder GPIO)
-# ============================================================
+ENCODER_DETENT_TICKS = 4
+QUAD_DELTA = {
+    0b0001: 1,
+    0b0111: 1,
+    0b1110: 1,
+    0b1000: 1,
+    0b0010: -1,
+    0b1011: -1,
+    0b1101: -1,
+    0b0100: -1,
+}
+
 
 class DummyDigitalOutputDevice:
     def __init__(self, pin, initial_value=False):
@@ -103,8 +102,6 @@ class DummyInputDevice:
     when_activated = None
     when_deactivated = None
     when_pressed = None
-    when_released = None
-    when_held = None
 
     def __init__(self, *args, **kwargs):
         pass
@@ -113,9 +110,12 @@ class DummyInputDevice:
         pass
 
 
-# ============================================================
-# FILE LOCATIONS
-# ============================================================
+class NavRow:
+    def __init__(self, widget, action, text):
+        self.widget = widget
+        self.action = action
+        self.text = text
+
 
 def get_real_home():
     sudo_user = os.environ.get("SUDO_USER")
@@ -143,10 +143,6 @@ SETTINGS_FILE = HOME / "jobo-settings.json"
 ON_PI = is_raspberry_pi()
 
 
-# ============================================================
-# DEFAULTS
-# ============================================================
-
 DEFAULT_SETTINGS = {
     "speed": 30,
     "left_seconds": 10.0,
@@ -157,7 +153,7 @@ DEFAULT_SETTINGS = {
 
 DEFAULT_RECIPES = [
     {
-        "name": "B&W voorbeeld",
+        "name": "B&W example",
         "speed": 30,
         "left_seconds": 10.0,
         "right_seconds": 10.0,
@@ -185,10 +181,6 @@ STEP_NAMES = [
     "Custom",
 ]
 
-
-# ============================================================
-# JSON
-# ============================================================
 
 def chown_if_sudo(filename):
     sudo_user = os.environ.get("SUDO_USER")
@@ -250,87 +242,70 @@ def normalize_settings(data):
     settings_data = copy.deepcopy(DEFAULT_SETTINGS)
     if not isinstance(data, dict):
         return settings_data
-
     try:
         settings_data["speed"] = int(clamp(int(data.get("speed", 30)), 0, 100))
     except (TypeError, ValueError):
         pass
-
     try:
         settings_data["left_seconds"] = float(
             clamp(float(data.get("left_seconds", 10.0)), 0.5, 60)
         )
     except (TypeError, ValueError):
         pass
-
     try:
         settings_data["right_seconds"] = float(
             clamp(float(data.get("right_seconds", 10.0)), 0.5, 60)
         )
     except (TypeError, ValueError):
         pass
-
     try:
         settings_data["direction_delay_ms"] = int(
             clamp(int(data.get("direction_delay_ms", 50)), 20, 500)
         )
     except (TypeError, ValueError):
         pass
-
     try:
         settings_data["encoder_step"] = int(
             clamp(int(data.get("encoder_step", 1)), 1, 10)
         )
     except (TypeError, ValueError):
         pass
-
     return settings_data
 
 
 def normalize_step(step):
     if not isinstance(step, dict):
         return {"name": "Wash", "seconds": 60, "motor": True}
-
     name = str(step.get("name") or "Custom")
     try:
         seconds = int(clamp(int(step.get("seconds", 60)), 1, 3600))
     except (TypeError, ValueError):
         seconds = 60
-
-    return {
-        "name": name,
-        "seconds": seconds,
-        "motor": bool(step.get("motor", True)),
-    }
+    return {"name": name, "seconds": seconds, "motor": bool(step.get("motor", True))}
 
 
-def normalize_recipe(recipe, fallback_name="Proces"):
+def normalize_recipe(recipe, fallback_name="Process"):
     if not isinstance(recipe, dict):
         recipe = {}
-
     steps = recipe.get("steps")
     if not isinstance(steps, list) or not steps:
         steps = [{"name": "Develop", "seconds": 300, "motor": True}]
-
     try:
         speed = int(clamp(int(recipe.get("speed", settings["speed"])), 0, 100))
     except (TypeError, ValueError):
         speed = settings["speed"]
-
     try:
         left_seconds = float(
             clamp(float(recipe.get("left_seconds", settings["left_seconds"])), 0.5, 60)
         )
     except (TypeError, ValueError):
         left_seconds = settings["left_seconds"]
-
     try:
         right_seconds = float(
             clamp(float(recipe.get("right_seconds", settings["right_seconds"])), 0.5, 60)
         )
     except (TypeError, ValueError):
         right_seconds = settings["right_seconds"]
-
     return {
         "name": str(recipe.get("name") or fallback_name),
         "speed": speed,
@@ -344,7 +319,7 @@ def normalize_recipes(data):
     if not isinstance(data, list) or not data:
         return copy.deepcopy(DEFAULT_RECIPES)
     recipes_data = [
-        normalize_recipe(recipe, f"Proces {index + 1}")
+        normalize_recipe(recipe, f"Process {index + 1}")
         for index, recipe in enumerate(data)
     ]
     return recipes_data or copy.deepcopy(DEFAULT_RECIPES)
@@ -353,10 +328,6 @@ def normalize_recipes(data):
 settings = normalize_settings(load_json(SETTINGS_FILE, DEFAULT_SETTINGS))
 recipes = normalize_recipes(load_json(RECIPES_FILE, DEFAULT_RECIPES))
 
-
-# ============================================================
-# HARDWARE PWM
-# ============================================================
 
 class HardwarePWM:
     def __init__(self, channel=0, period_ns=50_000):
@@ -369,7 +340,6 @@ class HardwarePWM:
         self.enable = self.pwm / "enable"
         self.period = self.pwm / "period"
         self.duty = self.pwm / "duty_cycle"
-
         self.write(self.enable, 0)
         self.write(self.duty, 0)
         self.write(self.period, self.period_ns)
@@ -387,9 +357,7 @@ class HardwarePWM:
             except Exception:
                 continue
         raise RuntimeError(
-            "Hardware PWM niet gevonden.\n"
-            "Controleer:\n"
-            "dtoverlay=pwm,pin=12,func=4"
+            "Hardware PWM not found. Check dtoverlay=pwm,pin=12,func=4"
         )
 
     def export(self):
@@ -403,7 +371,7 @@ class HardwarePWM:
             if self.pwm.exists():
                 return
             time.sleep(0.02)
-        raise RuntimeError("PWM kanaal kon niet worden aangemaakt.")
+        raise RuntimeError("PWM channel could not be created.")
 
     @staticmethod
     def write(path, value):
@@ -422,8 +390,7 @@ class HardwarePWM:
 
     def set_percent(self, percent):
         percent = clamp(float(percent), 0.0, 100.0)
-        duty = int(self.period_ns * percent / 100.0)
-        duty = clamp(duty, 0, self.period_ns)
+        duty = int(clamp(self.period_ns * percent / 100.0, 0, self.period_ns))
         if duty == self._last_duty:
             return
         self.write(self.duty, duty)
@@ -454,10 +421,6 @@ class DummyPWM:
         pass
 
 
-# ============================================================
-# MOTOR
-# ============================================================
-
 class MotorController:
     def __init__(self, simulated=False):
         self.simulated = simulated
@@ -465,7 +428,6 @@ class MotorController:
         self.ina = pin_class(INA_GPIO, initial_value=False)
         self.inb = pin_class(INB_GPIO, initial_value=False)
         self.pwm = DummyPWM() if simulated else HardwarePWM(PWM_CHANNEL, PWM_PERIOD_NS)
-
         self.running = False
         self.speed = 0
         self.direction = "LEFT"
@@ -547,12 +509,10 @@ class MotorController:
     def switch_direction(self, direction, finished=None):
         if self.switching or not self.running:
             return
-
         self.switching = True
         self._switch_token += 1
         token = self._switch_token
         delay = int(settings["direction_delay_ms"])
-
         try:
             self.pwm.stop()
         except Exception:
@@ -579,7 +539,7 @@ class MotorController:
             self._apply_direction(direction)
             self._restore_after = root.after(10, restore)
 
-        self._switch_after = root.after(delay, change)
+        self._switch_after = root.after(max(1, delay), change)
 
     def close(self):
         try:
@@ -597,13 +557,12 @@ class MotorController:
             pass
 
 
-# ============================================================
-# GLOBAL STATE
-# ============================================================
-
 root = None
 content = None
 temp_label = None
+list_canvas = None
+list_inner = None
+list_window = None
 motor = None
 simulated_hardware = False
 hardware_error = None
@@ -612,6 +571,7 @@ shutdown_event = threading.Event()
 temp_thread = None
 after_ids = {}
 
+current_screen = "menu"
 nav_items = []
 nav_index = 0
 
@@ -627,10 +587,8 @@ adjust_label = None
 
 choice_mode = False
 choice_values = []
-choice_index = 0
 choice_callback = None
 choice_cancel_callback = None
-choice_label = None
 
 encoder_lock = threading.Lock()
 pending_encoder_steps = 0
@@ -638,26 +596,13 @@ encoder_flush_scheduled = False
 encoder_quad_state = 0
 encoder_quad_accum = 0
 
-# KY-040: 4 flanken per detent = 1 draaistap.
-ENCODER_DETENT_TICKS = 4
-
-QUAD_DELTA = {
-    0b0001: 1,
-    0b0111: 1,
-    0b1110: 1,
-    0b1000: 1,
-    0b0010: -1,
-    0b1011: -1,
-    0b1101: -1,
-    0b0100: -1,
-}
-
 manual_active = False
 manual_next_switch = None
 manual_speed = settings["speed"]
-manual_direction_label = None
-manual_speed_label = None
-manual_start_button = None
+manual_motor_label = None
+manual_rows = {}
+
+settings_snapshot = None
 
 current_recipe_index = 0
 editor_recipe_index = 0
@@ -669,6 +614,7 @@ run_active = False
 run_paused = False
 run_step_finished = False
 run_remaining = 0.0
+run_step_total = 1.0
 run_last_tick = 0.0
 run_next_direction = None
 run_switch_remaining = None
@@ -676,17 +622,14 @@ run_switch_remaining = None
 process_timer_label = None
 process_motor_label = None
 process_status_label = None
-process_main_button = None
+progress_canvas = None
+pause_row = None
 
 encoder_a = None
 encoder_b = None
-extra_ok_button = None
-extra_back_button = None
+ok_button = None
+back_button = None
 
-
-# ============================================================
-# HELPERS
-# ============================================================
 
 def cancel_after(key):
     handle = after_ids.pop(key, None)
@@ -723,28 +666,45 @@ def stop_all_activity():
     run_next_direction = None
     run_switch_remaining = None
     manual_next_switch = None
-
     cancel_after("manual_tick")
     cancel_after("process_tick")
-
     if motor is not None:
         motor.stop()
 
 
-# ============================================================
-# TEMPERATURE
-# ============================================================
+def field(label, value):
+    return f"{label:<18}{value}"
+
+
+def format_time(seconds):
+    seconds = max(0, int(round(seconds)))
+    return f"{seconds // 60:02d}:{seconds % 60:02d}"
+
+
+def format_percent(value):
+    return f"{int(value)}%"
+
+
+def format_seconds(value):
+    return f"{float(value):.1f}s"
+
+
+def format_ms(value):
+    return f"{int(value)} ms"
+
 
 def read_temperature():
-    sensors = list(Path("/sys/bus/w1/devices").glob("28-*"))
+    base = Path("/sys/bus/w1/devices")
+    if not base.exists():
+        return None
+    sensors = list(base.glob("28-*"))
     if not sensors:
         return None
     try:
         text = (sensors[0] / "w1_slave").read_text()
         if "YES" not in text:
             return None
-        temp_text = text.split("t=")[-1]
-        return float(temp_text) / 1000.0
+        return float(text.split("t=")[-1]) / 1000.0
     except Exception:
         return None
 
@@ -756,81 +716,123 @@ def apply_temperature_text(text):
 def temperature_loop():
     while not shutdown_event.is_set():
         temp = read_temperature()
-        if temp is None:
-            text = "Temp. --.-°C"
-        else:
-            text = f"Temp. {temp:.1f}°C"
+        text = "Temp. --.-°C" if temp is None else f"Temp. {temp:.1f}°C"
         try:
             if root is not None:
                 root.after(0, apply_temperature_text, text)
         except Exception:
             break
-        shutdown_event.wait(2.0)
+        shutdown_event.wait(1.5)
 
-
-# ============================================================
-# GUI HELPERS
-# ============================================================
 
 def clear_screen():
-    global nav_items, nav_index
-    global adjust_mode, choice_mode
-
+    global nav_items, nav_index, list_canvas, list_inner, list_window
     for widget in content.winfo_children():
         widget.destroy()
-
     nav_items = []
     nav_index = 0
-    adjust_mode = False
-    choice_mode = False
+    list_canvas = None
+    list_inner = None
+    list_window = None
 
 
-def make_button(
-    parent,
-    text,
-    command,
-    width=16,
-    bg=BUTTON_BG,
-    font_size=16,
-    height=2,
-):
-    return tk.Button(
-        parent,
+def add_title(text, size=26):
+    tk.Label(
+        content,
         text=text,
-        command=command,
-        font=("Arial", font_size, "bold"),
-        width=width,
-        height=height,
-        bg=bg,
+        font=(FONT, size, "bold"),
+        bg=BG,
         fg=TEXT,
-        activebackground="#555555",
-        activeforeground=TEXT,
-        relief=tk.FLAT,
-        highlightthickness=0,
-        takefocus=0,
+        anchor="w",
+    ).pack(fill=tk.X, padx=36, pady=(10, 4))
+
+
+def add_info(text, size=16, color=MUTED):
+    label = tk.Label(
+        content,
+        text=text,
+        font=(FONT, size),
+        bg=BG,
+        fg=color,
+        anchor="w",
+        justify=tk.LEFT,
     )
+    label.pack(fill=tk.X, padx=40, pady=1)
+    return label
+
+
+def begin_rows():
+    global list_canvas, list_inner, list_window
+    list_canvas = tk.Canvas(content, bg=BG, highlightthickness=0, bd=0)
+    list_canvas.pack(fill=tk.BOTH, expand=True, pady=(6, 8))
+    list_inner = tk.Frame(list_canvas, bg=BG)
+    list_window = list_canvas.create_window((0, 0), window=list_inner, anchor="nw")
+
+    def sync(_event=None):
+        if list_canvas is None or list_inner is None:
+            return
+        try:
+            list_canvas.configure(scrollregion=list_canvas.bbox("all"))
+            list_canvas.itemconfigure(list_window, width=list_canvas.winfo_width())
+        except tk.TclError:
+            pass
+
+    list_inner.bind("<Configure>", sync)
+    list_canvas.bind("<Configure>", sync)
+    return list_inner
+
+
+def add_row(parent, text, action, size=20):
+    label = tk.Label(
+        parent,
+        text="  " + text,
+        font=(MONO, size),
+        bg=BG,
+        fg=TEXT,
+        anchor="w",
+        padx=32,
+    )
+    label.pack(fill=tk.X, pady=3)
+    return NavRow(label, action, text)
 
 
 def set_navigation(items, selected=0):
     global nav_items, nav_index
     nav_items = [item for item in items if item is not None]
     if not nav_items:
+        nav_index = 0
         return
-    nav_index = clamp(selected, 0, len(nav_items) - 1)
+    nav_index = int(clamp(selected, 0, len(nav_items) - 1))
     update_navigation()
 
 
 def update_navigation():
-    for index, widget in enumerate(nav_items):
-        if index == nav_index:
-            safe_config(
-                widget,
-                highlightthickness=4,
-                highlightbackground=SELECT,
-                highlightcolor=SELECT,
-            )
-        else:
-            safe_config(widget, highlightthickness=0)
+    for index, row in enumerate(nav_items):
+        selected = index == nav_index
+        prefix = "> " if selected else "  "
+        safe_config(
+            row.widget,
+            text=prefix + row.text,
+            fg=ACCENT if selected else TEXT,
+        )
+    reveal_selection()
+
+
+def reveal_selection():
+    if list_canvas is None or not nav_items:
+        return
+    widget = nav_items[nav_index].widget
+    try:
+        list_canvas.update_idletasks()
+        inner_h = max(1, list_inner.winfo_height())
+        view_h = max(1, list_canvas.winfo_height())
+        if inner_h <= view_h:
+            list_canvas.yview_moveto(0)
+            return
+        target = max(0, widget.winfo_y() - (view_h * 0.35))
+        list_canvas.yview_moveto(target / inner_h)
+    except tk.TclError:
+        pass
 
 
 def nav_move(steps):
@@ -844,100 +846,47 @@ def nav_move(steps):
 def nav_activate():
     if not nav_items:
         return
-    try:
-        nav_items[nav_index].invoke()
-    except Exception:
-        pass
+    action = nav_items[nav_index].action
+    if action:
+        action()
 
 
-# ============================================================
-# FORMAT
-# ============================================================
-
-def format_time(seconds):
-    seconds = max(0, int(round(seconds)))
-    return f"{seconds // 60:02d}:{seconds % 60:02d}"
-
-
-def format_percent(value):
-    return f"{int(value)}%"
-
-
-def format_seconds(value):
-    return f"{value:.1f} sec"
-
-
-def format_ms(value):
-    return f"{int(value)} ms"
-
-
-# ============================================================
-# VALUE ADJUSTMENT
-# ============================================================
-
-def open_adjust(
-    title,
-    value,
-    minimum,
-    maximum,
-    step,
-    callback,
-    cancel_callback,
-    formatter=None,
-):
-    global adjust_mode, adjust_value, adjust_min, adjust_max, adjust_step
+def open_adjust(title, value, minimum, maximum, step, callback, cancel_callback, formatter):
+    global adjust_mode, choice_mode, current_screen
+    global adjust_value, adjust_min, adjust_max, adjust_step
     global adjust_callback, adjust_cancel_callback, adjust_formatter, adjust_label
 
     adjust_mode = True
+    choice_mode = False
+    current_screen = "adjust"
     adjust_min = minimum
     adjust_max = maximum
     adjust_step = step
     adjust_value = snap_to_step(value, minimum, maximum, step)
     adjust_callback = callback
     adjust_cancel_callback = cancel_callback
-    adjust_formatter = formatter if formatter else str
+    adjust_formatter = formatter
 
     clear_screen()
-    adjust_mode = True
-
-    tk.Label(
-        content,
-        text=title,
-        font=("Arial", 25, "bold"),
-        bg=BG,
-        fg=TEXT,
-    ).pack(pady=(60, 25))
-
+    add_title(title.upper(), 24)
     adjust_label = tk.Label(
         content,
-        text=adjust_formatter(adjust_value),
-        font=("Arial", 50, "bold"),
+        text=formatter(adjust_value),
+        font=(FONT, 54, "bold"),
         bg=BG,
-        fg=SELECT,
+        fg=ACCENT,
     )
-    adjust_label.pack(pady=20)
-
-    row = tk.Frame(content, bg=BG)
-    row.pack(pady=20)
-
-    minus = make_button(row, "−", lambda: adjust_change(-1), width=5, font_size=26)
-    minus.pack(side=tk.LEFT, padx=10)
-
-    okay = make_button(row, "OK", adjust_confirm, width=8, bg=GREEN)
-    okay.pack(side=tk.LEFT, padx=10)
-
-    plus = make_button(row, "+", lambda: adjust_change(1), width=5, font_size=26)
-    plus.pack(side=tk.LEFT, padx=10)
-
-    cancel = make_button(content, "ANNULEREN", adjust_cancel, width=12)
-    cancel.pack(pady=5)
-
-    set_navigation([minus, okay, plus, cancel], 1)
+    adjust_label.pack(pady=(18, 16))
+    parent = begin_rows()
+    set_navigation([
+        add_row(parent, "OK", adjust_confirm),
+        add_row(parent, "CANCEL", adjust_cancel),
+    ])
 
 
 def adjust_change(steps):
     global adjust_value
-    if not adjust_mode:
+    if not adjust_mode or not steps:
         return
     adjust_value = snap_to_step(
         adjust_value + (steps * adjust_step),
@@ -965,65 +914,34 @@ def adjust_cancel():
         callback()
 
 
-# ============================================================
-# CHOICE
-# ============================================================
-
 def open_choice(title, values, current_value, callback, cancel_callback):
-    global choice_mode, choice_values, choice_index
-    global choice_callback, choice_cancel_callback, choice_label
+    global choice_mode, adjust_mode, current_screen
+    global choice_values, choice_callback, choice_cancel_callback
 
     choice_mode = True
+    adjust_mode = False
+    current_screen = "choice"
     choice_values = list(values)
     choice_callback = callback
     choice_cancel_callback = cancel_callback
-
     try:
-        choice_index = choice_values.index(current_value)
+        selected = choice_values.index(current_value)
     except ValueError:
-        choice_index = 0
+        selected = 0
 
     clear_screen()
-    choice_mode = True
-
-    tk.Label(
-        content,
-        text=title,
-        font=("Arial", 25, "bold"),
-        bg=BG,
-        fg=TEXT,
-    ).pack(pady=(60, 25))
-
-    choice_label = tk.Label(
-        content,
-        text=choice_values[choice_index] if choice_values else "",
-        font=("Arial", 42, "bold"),
-        bg=BG,
-        fg=SELECT,
-    )
-    choice_label.pack(pady=30)
-
-    okay = make_button(content, "OK", choice_confirm, width=12, bg=GREEN)
-    okay.pack(pady=8)
-
-    cancel = make_button(content, "ANNULEREN", choice_cancel, width=12)
-    cancel.pack(pady=5)
-
-    set_navigation([okay, cancel])
+    add_title(title.upper(), 24)
+    parent = begin_rows()
+    rows = [
+        add_row(parent, value, lambda chosen=value: finish_choice(chosen))
+        for value in choice_values
+    ]
+    set_navigation(rows, selected)
 
 
-def choice_change(steps):
-    global choice_index
-    if not choice_mode or not choice_values:
-        return
-    choice_index = (choice_index + int(steps)) % len(choice_values)
-    safe_config(choice_label, text=choice_values[choice_index])
-
-
-def choice_confirm():
+def finish_choice(value):
     global choice_mode
     callback = choice_callback
-    value = choice_values[choice_index]
     choice_mode = False
     if callback:
         callback(value)
@@ -1037,142 +955,54 @@ def choice_cancel():
         callback()
 
 
-# ============================================================
-# MAIN MENU
-# ============================================================
-
 def show_main_menu():
+    global current_screen, adjust_mode, choice_mode
     stop_all_activity()
+    adjust_mode = False
+    choice_mode = False
+    current_screen = "menu"
     clear_screen()
-
-    tk.Label(
-        content,
-        text="JOBO PROCESSOR",
-        font=("Arial", 32, "bold"),
-        fg=TEXT,
-        bg=BG,
-    ).pack(pady=(35, 25))
-
-    if simulated_hardware:
-        message = "SIMULATIE — geen GPIO/PWM"
-        if hardware_error:
-            message = f"HARDWARE FOUT: {hardware_error}"
-        tk.Label(
-            content,
-            text=message,
-            font=("Arial", 12, "bold"),
-            fg=ORANGE,
-            bg=BG,
-            wraplength=720,
-            justify=tk.CENTER,
-        ).pack(pady=(0, 8))
-
-    manual = make_button(
-        content, "▶ ONTWIKKELEN", show_manual, width=22, bg=GREEN, font_size=19
-    )
-    manual.pack(pady=7)
-
-    process = make_button(
-        content, "PROCESSEN", show_process_select, width=22, bg=BLUE, font_size=19
-    )
-    process.pack(pady=7)
-
-    setting = make_button(
-        content, "INSTELLINGEN", show_settings, width=22, font_size=19
-    )
-    setting.pack(pady=7)
-
-    quit_button = make_button(
-        content, "AFSLUITEN", close_app, width=15, bg=RED, font_size=13
-    )
-    quit_button.pack(pady=16)
-
-    set_navigation([manual, process, setting, quit_button])
+    if hardware_error:
+        add_info(str(hardware_error), 13, RED)
+    elif simulated_hardware and ON_PI:
+        add_info("Motor in simulation", 13, ORANGE)
+    parent = begin_rows()
+    set_navigation([
+        add_row(parent, "DEVELOP", enter_manual),
+        add_row(parent, "PROCESSES", show_process_select),
+        add_row(parent, "SETTINGS", enter_settings),
+        add_row(parent, "SHUTDOWN", shutdown_pi),
+    ])
 
 
-# ============================================================
-# SETTINGS
-# ============================================================
+def enter_settings():
+    global settings_snapshot
+    settings_snapshot = copy.deepcopy(settings)
+    show_settings()
+
 
 def show_settings():
+    global current_screen, adjust_mode, choice_mode
+    adjust_mode = False
+    choice_mode = False
+    current_screen = "settings"
     clear_screen()
-
-    tk.Label(
-        content,
-        text="INSTELLINGEN",
-        font=("Arial", 27, "bold"),
-        bg=BG,
-        fg=TEXT,
-    ).pack(pady=(15, 12))
-
-    speed = make_button(
-        content,
-        f"Standaard snelheid   {settings['speed']}%",
-        settings_speed,
-        width=28,
-        font_size=14,
-    )
-    speed.pack(pady=4)
-
-    left = make_button(
-        content,
-        f"Linksom tijd   {settings['left_seconds']} sec",
-        settings_left,
-        width=28,
-        font_size=14,
-    )
-    left.pack(pady=4)
-
-    right = make_button(
-        content,
-        f"Rechtsom tijd   {settings['right_seconds']} sec",
-        settings_right,
-        width=28,
-        font_size=14,
-    )
-    right.pack(pady=4)
-
-    delay = make_button(
-        content,
-        f"Richtingswissel   {settings['direction_delay_ms']} ms",
-        settings_delay,
-        width=28,
-        font_size=14,
-    )
-    delay.pack(pady=4)
-
-    encoder = make_button(
-        content,
-        f"Encoder stap   {settings['encoder_step']}%",
-        settings_encoder_step,
-        width=28,
-        font_size=14,
-    )
-    encoder.pack(pady=4)
-
-    back = make_button(
-        content,
-        "OPSLAAN & TERUG",
-        save_settings_and_back,
-        width=18,
-        bg=GREEN,
-        font_size=13,
-    )
-    back.pack(pady=12)
-
-    set_navigation([speed, left, right, delay, encoder, back])
+    add_title("SETTINGS")
+    parent = begin_rows()
+    set_navigation([
+        add_row(parent, field("Speed", f"{settings['speed']}%"), settings_speed, 18),
+        add_row(parent, field("Left time", format_seconds(settings["left_seconds"])), settings_left, 18),
+        add_row(parent, field("Right time", format_seconds(settings["right_seconds"])), settings_right, 18),
+        add_row(parent, field("Turn delay", format_ms(settings["direction_delay_ms"])), settings_delay, 18),
+        add_row(parent, field("Encoder step", f"{settings['encoder_step']}%"), settings_encoder_step, 18),
+        add_row(parent, "SAVE & BACK", save_settings_and_back, 18),
+    ])
 
 
 def settings_speed():
     open_adjust(
-        "Standaard motorsnelheid",
-        settings["speed"],
-        0,
-        100,
-        1,
-        save_setting_speed,
-        show_settings,
-        format_percent,
+        "Default speed", settings["speed"], 0, 100, 1,
+        save_setting_speed, show_settings, format_percent,
     )
 
 
@@ -1183,50 +1013,32 @@ def save_setting_speed(value):
 
 def settings_left():
     open_adjust(
-        "Standaard linksom",
-        settings["left_seconds"],
-        0.5,
-        60,
-        0.5,
-        save_setting_left,
-        show_settings,
-        format_seconds,
+        "Left time", settings["left_seconds"], 0.5, 60, 0.5,
+        save_setting_left, show_settings, format_seconds,
     )
 
 
 def save_setting_left(value):
-    settings["left_seconds"] = round(value, 1)
+    settings["left_seconds"] = round(float(value), 1)
     show_settings()
 
 
 def settings_right():
     open_adjust(
-        "Standaard rechtsom",
-        settings["right_seconds"],
-        0.5,
-        60,
-        0.5,
-        save_setting_right,
-        show_settings,
-        format_seconds,
+        "Right time", settings["right_seconds"], 0.5, 60, 0.5,
+        save_setting_right, show_settings, format_seconds,
     )
 
 
 def save_setting_right(value):
-    settings["right_seconds"] = round(value, 1)
+    settings["right_seconds"] = round(float(value), 1)
     show_settings()
 
 
 def settings_delay():
     open_adjust(
-        "Richtingswissel",
-        settings["direction_delay_ms"],
-        20,
-        500,
-        10,
-        save_setting_delay,
-        show_settings,
-        format_ms,
+        "Turn delay", settings["direction_delay_ms"], 20, 500, 10,
+        save_setting_delay, show_settings, format_ms,
     )
 
 
@@ -1237,14 +1049,8 @@ def save_setting_delay(value):
 
 def settings_encoder_step():
     open_adjust(
-        "Encoder snelheidsstap",
-        settings["encoder_step"],
-        1,
-        10,
-        1,
-        save_setting_encoder,
-        show_settings,
-        format_percent,
+        "Encoder step", settings["encoder_step"], 1, 10, 1,
+        save_setting_encoder, show_settings, format_percent,
     )
 
 
@@ -1254,138 +1060,169 @@ def save_setting_encoder(value):
 
 
 def save_settings_and_back():
+    global settings_snapshot
     save_json(SETTINGS_FILE, settings)
+    settings_snapshot = None
     show_main_menu()
 
 
-# ============================================================
-# MANUAL DEVELOP MODE
-# ============================================================
+def abandon_settings():
+    global settings_snapshot
+    if settings_snapshot is not None:
+        settings.clear()
+        settings.update(settings_snapshot)
+    settings_snapshot = None
+    show_main_menu()
 
-def show_manual():
+
+def enter_manual():
     global manual_active, manual_next_switch, manual_speed
-    global manual_direction_label, manual_speed_label, manual_start_button
-
     stop_all_activity()
-    manual_speed = settings["speed"]
+    manual_speed = int(settings["speed"])
+    manual_next_switch = None
+    render_manual()
 
+
+def render_manual():
+    global current_screen, adjust_mode, choice_mode
+    global manual_motor_label, manual_rows
+    adjust_mode = False
+    choice_mode = False
+    current_screen = "manual"
     clear_screen()
-
-    tk.Label(
-        content,
-        text="HANDMATIG ONTWIKKELEN",
-        font=("Arial", 25, "bold"),
-        fg=TEXT,
-        bg=BG,
-    ).pack(pady=(20, 8))
-
-    manual_direction_label = tk.Label(
-        content,
-        text="MOTOR UIT",
-        font=("Arial", 18, "bold"),
-        fg=MUTED,
-        bg=BG,
+    add_title("DEVELOP")
+    manual_motor_label = add_info(manual_status_text(), 18, TEXT)
+    parent = begin_rows()
+    speed_row = add_row(parent, field("Speed", f"{manual_speed}%"), edit_manual_speed, 18)
+    left_row = add_row(
+        parent, field("Left time", format_seconds(settings["left_seconds"])), edit_manual_left, 18
     )
-    manual_direction_label.pack(pady=5)
-
-    manual_speed_label = tk.Label(
-        content,
-        text=f"{manual_speed}%",
-        font=("Arial", 48, "bold"),
-        fg=SELECT,
-        bg=BG,
+    right_row = add_row(
+        parent, field("Right time", format_seconds(settings["right_seconds"])), edit_manual_right, 18
     )
-    manual_speed_label.pack(pady=10)
+    action = "STOP" if manual_active else "START"
+    action_row = add_row(parent, action, toggle_manual_motor, 18)
+    back_row = add_row(parent, "BACK", leave_manual, 18)
+    manual_rows = {
+        "speed": speed_row,
+        "left": left_row,
+        "right": right_row,
+        "action": action_row,
+    }
+    set_navigation([speed_row, left_row, right_row, action_row, back_row], 3 if manual_active else 0)
 
-    tk.Label(
-        content,
-        text=f"◀ {settings['left_seconds']} sec     ▶ {settings['right_seconds']} sec",
-        font=("Arial", 15),
-        fg=TEXT,
-        bg=BG,
-    ).pack(pady=4)
 
-    manual_start_button = make_button(
-        content, "START", toggle_manual_motor, width=15, bg=GREEN, font_size=20
+def manual_status_text():
+    if not manual_active or motor is None or not motor.running:
+        return "Motor           OFF"
+    if motor.direction == "LEFT":
+        return "Motor           ◀ LEFT"
+    return "Motor           RIGHT ▶"
+
+
+def refresh_manual_rows():
+    if "speed" in manual_rows:
+        manual_rows["speed"].text = field("Speed", f"{manual_speed}%")
+    if "action" in manual_rows:
+        manual_rows["action"].text = "STOP" if manual_active else "START"
+    safe_config(manual_motor_label, text=manual_status_text(), fg=ACCENT if manual_active else TEXT)
+    update_navigation()
+
+
+def edit_manual_speed():
+    if manual_active:
+        return
+    open_adjust(
+        "Speed", manual_speed, 0, 100, 1,
+        save_manual_speed, render_manual, format_percent,
     )
-    manual_start_button.pack(pady=15)
 
-    back = make_button(content, "TERUG", leave_manual, width=12, font_size=13)
-    back.pack(pady=5)
 
-    set_navigation([manual_start_button, back])
+def save_manual_speed(value):
+    global manual_speed
+    manual_speed = int(value)
+    render_manual()
+
+
+def edit_manual_left():
+    if manual_active:
+        return
+    open_adjust(
+        "Left time", settings["left_seconds"], 0.5, 60, 0.5,
+        save_manual_left, render_manual, format_seconds,
+    )
+
+
+def save_manual_left(value):
+    settings["left_seconds"] = round(float(value), 1)
+    save_json(SETTINGS_FILE, settings)
+    render_manual()
+
+
+def edit_manual_right():
+    if manual_active:
+        return
+    open_adjust(
+        "Right time", settings["right_seconds"], 0.5, 60, 0.5,
+        save_manual_right, render_manual, format_seconds,
+    )
+
+
+def save_manual_right(value):
+    settings["right_seconds"] = round(float(value), 1)
+    save_json(SETTINGS_FILE, settings)
+    render_manual()
 
 
 def toggle_manual_motor():
     global manual_active, manual_next_switch
-
     if manual_active:
         manual_active = False
         manual_next_switch = None
         cancel_after("manual_tick")
         motor.stop()
-        safe_config(manual_start_button, text="START", bg=GREEN)
-        safe_config(manual_direction_label, text="MOTOR UIT", fg=MUTED)
+        refresh_manual_rows()
         return
 
     manual_active = True
     motor.start(manual_speed, "LEFT")
     manual_next_switch = time.monotonic() + settings["left_seconds"]
-    safe_config(manual_start_button, text="STOP", bg=RED)
-    safe_config(manual_direction_label, text="◀ LINKS", fg=TEXT)
+    refresh_manual_rows()
     manual_tick()
-
-
-def update_manual_direction_label():
-    if motor.direction == "LEFT":
-        safe_config(manual_direction_label, text="◀ LINKS", fg=TEXT)
-    else:
-        safe_config(manual_direction_label, text="RECHTS ▶", fg=TEXT)
 
 
 def manual_tick():
     global manual_next_switch
-
     after_ids.pop("manual_tick", None)
     if not manual_active:
         return
-
     now = time.monotonic()
-    if (
-        manual_next_switch
-        and now >= manual_next_switch
-        and not motor.switching
-    ):
+    if manual_next_switch and now >= manual_next_switch and not motor.switching:
         if motor.direction == "LEFT":
             direction = "RIGHT"
             duration = settings["right_seconds"]
         else:
             direction = "LEFT"
             duration = settings["left_seconds"]
-
-        motor.switch_direction(direction, update_manual_direction_label)
+        motor.switch_direction(direction, refresh_manual_rows)
         manual_next_switch = now + duration
-
+    safe_config(manual_motor_label, text=manual_status_text(), fg=ACCENT)
     schedule("manual_tick", 50, manual_tick)
 
 
 def manual_speed_change(steps):
     global manual_speed
-    manual_speed = int(
-        clamp(manual_speed + (steps * settings["encoder_step"]), 0, 100)
-    )
+    if not steps:
+        return
+    manual_speed = int(clamp(manual_speed + (steps * settings["encoder_step"]), 0, 100))
     motor.set_speed(manual_speed)
-    safe_config(manual_speed_label, text=f"{manual_speed}%")
+    refresh_manual_rows()
 
 
 def leave_manual():
     stop_all_activity()
     show_main_menu()
 
-
-# ============================================================
-# PROCESS SELECT
-# ============================================================
 
 def ensure_recipes():
     global recipes, current_recipe_index
@@ -1395,90 +1232,51 @@ def ensure_recipes():
 
 
 def show_process_select():
+    global current_screen, adjust_mode, choice_mode
     stop_all_activity()
     ensure_recipes()
+    adjust_mode = False
+    choice_mode = False
+    current_screen = "processes"
     clear_screen()
+    add_title("PROCESSES")
+    parent = begin_rows()
+    rows = []
+    for index, recipe in enumerate(recipes):
+        rows.append(add_row(parent, recipe["name"], lambda i=index: open_recipe(i), 20))
+    rows.append(add_row(parent, "+ NEW", add_recipe, 20))
+    rows.append(add_row(parent, "BACK", show_main_menu, 20))
+    selected = min(current_recipe_index, len(rows) - 1)
+    set_navigation(rows, selected)
 
+
+def open_recipe(index):
+    global current_recipe_index
+    current_recipe_index = index
+    show_recipe_actions()
+
+
+def show_recipe_actions():
+    global current_screen
+    ensure_recipes()
+    current_screen = "recipe"
     recipe = recipes[current_recipe_index]
-
-    tk.Label(
-        content,
-        text="PROCESSEN",
-        font=("Arial", 26, "bold"),
-        fg=TEXT,
-        bg=BG,
-    ).pack(pady=(18, 5))
-
-    tk.Label(
-        content,
-        text=f"{current_recipe_index + 1} / {len(recipes)}",
-        font=("Arial", 13),
-        fg=MUTED,
-        bg=BG,
-    ).pack()
-
-    tk.Label(
-        content,
-        text=recipe["name"],
-        font=("Arial", 30, "bold"),
-        fg=SELECT,
-        bg=BG,
-    ).pack(pady=15)
-
-    row = tk.Frame(content, bg=BG)
-    row.pack()
-
-    previous = make_button(row, "◀", previous_recipe, width=5)
-    previous.pack(side=tk.LEFT, padx=8)
-
-    next_button = make_button(row, "▶", next_recipe, width=5)
-    next_button.pack(side=tk.LEFT, padx=8)
-
-    row2 = tk.Frame(content, bg=BG)
-    row2.pack(pady=12)
-
-    start = make_button(row2, "START PROCES", start_selected_recipe, width=13, bg=GREEN)
-    start.pack(side=tk.LEFT, padx=5)
-
-    edit = make_button(row2, "BEWERK", edit_selected_recipe, width=10, bg=BLUE)
-    edit.pack(side=tk.LEFT, padx=5)
-
-    new = make_button(row2, "+ NIEUW", add_recipe, width=10)
-    new.pack(side=tk.LEFT, padx=5)
-
-    row3 = tk.Frame(content, bg=BG)
-    row3.pack(pady=3)
-
-    delete = make_button(
-        row3, "VERWIJDER", delete_recipe, width=10, bg=RED, font_size=12
-    )
-    delete.pack(side=tk.LEFT, padx=5)
-
-    back = make_button(row3, "TERUG", show_main_menu, width=10, font_size=12)
-    back.pack(side=tk.LEFT, padx=5)
-
-    set_navigation([previous, next_button, start, edit, new, delete, back], 2)
-
-
-def previous_recipe():
-    global current_recipe_index
-    ensure_recipes()
-    current_recipe_index = (current_recipe_index - 1) % len(recipes)
-    show_process_select()
-
-
-def next_recipe():
-    global current_recipe_index
-    ensure_recipes()
-    current_recipe_index = (current_recipe_index + 1) % len(recipes)
-    show_process_select()
+    clear_screen()
+    add_title(recipe["name"])
+    add_info(f"{len(recipe['steps'])} steps   {recipe['speed']}%", 15, MUTED)
+    parent = begin_rows()
+    set_navigation([
+        add_row(parent, "START PROCESS", start_selected_recipe),
+        add_row(parent, "EDIT", edit_selected_recipe),
+        add_row(parent, "DELETE", delete_recipe),
+        add_row(parent, "BACK", show_process_select),
+    ])
 
 
 def add_recipe():
     global current_recipe_index, editor_recipe_index, editor_step_index
-
     recipe = {
-        "name": f"Proces {len(recipes) + 1}",
+        "name": f"Process {len(recipes) + 1}",
         "speed": settings["speed"],
         "left_seconds": settings["left_seconds"],
         "right_seconds": settings["right_seconds"],
@@ -1508,129 +1306,45 @@ def edit_selected_recipe():
     show_process_editor()
 
 
-# ============================================================
-# PROCESS EDITOR
-# ============================================================
-
-def show_process_editor():
-    global editor_step_index
-
-    recipe = recipes[editor_recipe_index]
-    editor_step_index = clamp(editor_step_index, 0, len(recipe["steps"]) - 1)
-    step = recipe["steps"][editor_step_index]
-
-    clear_screen()
-
-    tk.Label(
-        content,
-        text=recipe["name"],
-        font=("Arial", 23, "bold"),
-        fg=TEXT,
-        bg=BG,
-    ).pack(pady=(8, 3))
-
-    top = tk.Frame(content, bg=BG)
-    top.pack(pady=2)
-
-    speed = make_button(
-        top,
-        f"Snelheid\n{recipe['speed']}%",
-        edit_recipe_speed,
-        width=9,
-        font_size=12,
-    )
-    speed.pack(side=tk.LEFT, padx=4)
-
-    left = make_button(
-        top,
-        f"Links\n{recipe['left_seconds']}s",
-        edit_recipe_left,
-        width=9,
-        font_size=12,
-    )
-    left.pack(side=tk.LEFT, padx=4)
-
-    right = make_button(
-        top,
-        f"Rechts\n{recipe['right_seconds']}s",
-        edit_recipe_right,
-        width=9,
-        font_size=12,
-    )
-    right.pack(side=tk.LEFT, padx=4)
-
-    tk.Label(
-        content,
-        text=f"STAP {editor_step_index + 1} / {len(recipe['steps'])}",
-        font=("Arial", 13),
-        fg=MUTED,
-        bg=BG,
-    ).pack(pady=(8, 2))
-
-    edit_step_button = make_button(
-        content,
-        f"{step['name']}    {format_time(step['seconds'])}",
-        show_step_editor,
-        width=24,
-        bg=BLUE,
-        font_size=17,
-    )
-    edit_step_button.pack(pady=4)
-
-    nav = tk.Frame(content, bg=BG)
-    nav.pack(pady=2)
-
-    previous = make_button(nav, "◀ VORIGE", previous_step, width=10, font_size=11)
-    previous.pack(side=tk.LEFT, padx=4)
-
-    next_button = make_button(nav, "VOLGENDE ▶", next_step, width=10, font_size=11)
-    next_button.pack(side=tk.LEFT, padx=4)
-
-    actions = tk.Frame(content, bg=BG)
-    actions.pack(pady=2)
-
-    add = make_button(actions, "+ STAP", add_step, width=8, bg=GREEN, font_size=11)
-    add.pack(side=tk.LEFT, padx=3)
-
-    delete = make_button(actions, "− STAP", delete_step, width=8, bg=RED, font_size=11)
-    delete.pack(side=tk.LEFT, padx=3)
-
-    save = make_button(actions, "OPSLAAN", save_process, width=9, bg=ORANGE, font_size=11)
-    save.pack(side=tk.LEFT, padx=3)
-
-    back = make_button(content, "TERUG", show_process_select, width=10, font_size=10)
-    back.pack(pady=2)
-
-    set_navigation(
-        [
-            speed,
-            left,
-            right,
-            edit_step_button,
-            previous,
-            next_button,
-            add,
-            delete,
-            save,
-            back,
-        ]
-    )
-
-
 def current_editor_recipe():
     return recipes[editor_recipe_index]
 
 
+def show_process_editor():
+    global current_screen, editor_step_index, adjust_mode, choice_mode
+    adjust_mode = False
+    choice_mode = False
+    current_screen = "editor"
+    recipe = current_editor_recipe()
+    editor_step_index = int(clamp(editor_step_index, 0, len(recipe["steps"]) - 1))
+    step = recipe["steps"][editor_step_index]
+    clear_screen()
+    add_title(recipe["name"], 24)
+    add_info(
+        f"Step {editor_step_index + 1}/{len(recipe['steps'])}    "
+        f"{step['name']}    {format_time(step['seconds'])}",
+        16,
+        ACCENT,
+    )
+    parent = begin_rows()
+    set_navigation([
+        add_row(parent, field("Speed", f"{recipe['speed']}%"), edit_recipe_speed, 17),
+        add_row(parent, field("Left", format_seconds(recipe["left_seconds"])), edit_recipe_left, 17),
+        add_row(parent, field("Right", format_seconds(recipe["right_seconds"])), edit_recipe_right, 17),
+        add_row(parent, "PREVIOUS STEP", previous_step, 17),
+        add_row(parent, "NEXT STEP", next_step, 17),
+        add_row(parent, "EDIT STEP", show_step_editor, 17),
+        add_row(parent, "+ STEP", add_step, 17),
+        add_row(parent, "- STEP", delete_step, 17),
+        add_row(parent, "SAVE", save_process, 17),
+        add_row(parent, "BACK", show_process_select, 17),
+    ])
+
+
 def edit_recipe_speed():
     open_adjust(
-        "Proces snelheid",
-        current_editor_recipe()["speed"],
-        0,
-        100,
-        1,
-        save_recipe_speed,
-        show_process_editor,
-        format_percent,
+        "Process speed", current_editor_recipe()["speed"], 0, 100, 1,
+        save_recipe_speed, show_process_editor, format_percent,
     )
 
 
@@ -1641,51 +1355,39 @@ def save_recipe_speed(value):
 
 def edit_recipe_left():
     open_adjust(
-        "Linksom tijd",
-        current_editor_recipe()["left_seconds"],
-        0.5,
-        60,
-        0.5,
-        save_recipe_left,
-        show_process_editor,
-        format_seconds,
+        "Left time", current_editor_recipe()["left_seconds"], 0.5, 60, 0.5,
+        save_recipe_left, show_process_editor, format_seconds,
     )
 
 
 def save_recipe_left(value):
-    current_editor_recipe()["left_seconds"] = round(value, 1)
+    current_editor_recipe()["left_seconds"] = round(float(value), 1)
     show_process_editor()
 
 
 def edit_recipe_right():
     open_adjust(
-        "Rechtsom tijd",
-        current_editor_recipe()["right_seconds"],
-        0.5,
-        60,
-        0.5,
-        save_recipe_right,
-        show_process_editor,
-        format_seconds,
+        "Right time", current_editor_recipe()["right_seconds"], 0.5, 60, 0.5,
+        save_recipe_right, show_process_editor, format_seconds,
     )
 
 
 def save_recipe_right(value):
-    current_editor_recipe()["right_seconds"] = round(value, 1)
+    current_editor_recipe()["right_seconds"] = round(float(value), 1)
     show_process_editor()
 
 
 def previous_step():
     global editor_step_index
-    steps = current_editor_recipe()["steps"]
-    editor_step_index = (editor_step_index - 1) % len(steps)
+    count = len(current_editor_recipe()["steps"])
+    editor_step_index = (editor_step_index - 1) % count
     show_process_editor()
 
 
 def next_step():
     global editor_step_index
-    steps = current_editor_recipe()["steps"]
-    editor_step_index = (editor_step_index + 1) % len(steps)
+    count = len(current_editor_recipe()["steps"])
+    editor_step_index = (editor_step_index + 1) % count
     show_process_editor()
 
 
@@ -1712,66 +1414,31 @@ def save_process():
     show_process_select()
 
 
-# ============================================================
-# STEP EDITOR
-# ============================================================
-
 def current_step():
     return recipes[editor_recipe_index]["steps"][editor_step_index]
 
 
 def show_step_editor():
+    global current_screen, adjust_mode, choice_mode
+    adjust_mode = False
+    choice_mode = False
+    current_screen = "step"
     step = current_step()
     clear_screen()
-
-    tk.Label(
-        content,
-        text=f"STAP {editor_step_index + 1}",
-        font=("Arial", 26, "bold"),
-        bg=BG,
-        fg=TEXT,
-    ).pack(pady=(35, 15))
-
-    name = make_button(
-        content,
-        "Naam: " + step["name"],
-        edit_step_name,
-        width=24,
-        bg=BLUE,
-    )
-    name.pack(pady=6)
-
-    duration = make_button(
-        content,
-        "Tijd: " + format_time(step["seconds"]),
-        edit_step_time,
-        width=24,
-    )
-    duration.pack(pady=6)
-
-    motor_on = step.get("motor", True)
-    motor_button = make_button(
-        content,
-        "Motor: " + ("AAN" if motor_on else "UIT"),
-        toggle_step_motor,
-        width=24,
-    )
-    motor_button.pack(pady=6)
-
-    done = make_button(content, "KLAAR", show_process_editor, width=14, bg=GREEN)
-    done.pack(pady=15)
-
-    set_navigation([name, duration, motor_button, done])
+    add_title(f"STEP {editor_step_index + 1}")
+    parent = begin_rows()
+    motor_text = "ON" if step.get("motor", True) else "OFF"
+    set_navigation([
+        add_row(parent, field("Name", step["name"]), edit_step_name, 18),
+        add_row(parent, field("Time", format_time(step["seconds"])), edit_step_time, 18),
+        add_row(parent, field("Motor", motor_text), toggle_step_motor, 18),
+        add_row(parent, "DONE", show_process_editor, 18),
+        add_row(parent, "BACK", show_process_editor, 18),
+    ])
 
 
 def edit_step_name():
-    open_choice(
-        "Stapnaam",
-        STEP_NAMES,
-        current_step()["name"],
-        save_step_name,
-        show_step_editor,
-    )
+    open_choice("Step name", STEP_NAMES, current_step()["name"], save_step_name, show_step_editor)
 
 
 def save_step_name(value):
@@ -1781,14 +1448,8 @@ def save_step_name(value):
 
 def edit_step_time():
     open_adjust(
-        "Stapduur",
-        current_step()["seconds"],
-        1,
-        3600,
-        5,
-        save_step_time,
-        show_step_editor,
-        format_time,
+        "Step duration", current_step()["seconds"], 1, 3600, 5,
+        save_step_time, show_step_editor, format_time,
     )
 
 
@@ -1803,10 +1464,6 @@ def toggle_step_motor():
     show_step_editor()
 
 
-# ============================================================
-# PROCESS RUNNING
-# ============================================================
-
 def start_selected_recipe():
     global run_recipe, run_step_index
     run_recipe = copy.deepcopy(recipes[current_recipe_index])
@@ -1816,110 +1473,97 @@ def start_selected_recipe():
 
 def prepare_process_step():
     global run_active, run_paused, run_step_finished
-    global run_remaining, run_next_direction, run_switch_remaining
+    global run_remaining, run_step_total, run_next_direction, run_switch_remaining
 
     motor.stop()
     cancel_after("process_tick")
-
     run_active = False
     run_paused = False
     run_step_finished = False
-    run_remaining = float(run_recipe["steps"][run_step_index]["seconds"])
+    run_step_total = float(run_recipe["steps"][run_step_index]["seconds"])
+    run_remaining = run_step_total
     run_next_direction = None
     run_switch_remaining = None
-
     show_process_run_screen(waiting=True)
 
 
 def show_process_run_screen(waiting=False):
-    global process_timer_label, process_motor_label
-    global process_status_label, process_main_button
+    global current_screen, process_timer_label, process_motor_label
+    global process_status_label, progress_canvas, pause_row
+    global adjust_mode, choice_mode
 
+    adjust_mode = False
+    choice_mode = False
+    current_screen = "run"
     step = run_recipe["steps"][run_step_index]
     clear_screen()
 
-    tk.Label(
-        content,
-        text=run_recipe["name"],
-        font=("Arial", 17, "bold"),
-        bg=BG,
-        fg=MUTED,
-    ).pack(pady=(7, 0))
-
-    tk.Label(
-        content,
-        text=f"STAP {run_step_index + 1} / {len(run_recipe['steps'])}",
-        font=("Arial", 13),
-        bg=BG,
-        fg=MUTED,
-    ).pack()
-
-    tk.Label(
-        content,
-        text=step["name"].upper(),
-        font=("Arial", 28, "bold"),
-        bg=BG,
-        fg=TEXT,
-    ).pack(pady=(5, 0))
-
+    add_info(run_recipe["name"], 16, MUTED)
+    add_title(step["name"].upper(), 28)
     process_timer_label = tk.Label(
         content,
         text=format_time(run_remaining),
-        font=("Arial", 60, "bold"),
+        font=(FONT, 58, "bold"),
         bg=BG,
-        fg=SELECT,
+        fg=ORANGE if run_remaining <= 10 else ACCENT,
     )
-    process_timer_label.pack(pady=4)
-
-    process_motor_label = tk.Label(
-        content,
-        text=process_motor_text(),
-        font=("Arial", 13),
-        bg=BG,
-        fg=TEXT,
+    process_timer_label.pack(pady=(2, 0))
+    progress_canvas = tk.Canvas(
+        content, width=680, height=18, bg=TRACK, highlightthickness=0, bd=0,
     )
-    process_motor_label.pack(pady=2)
-
-    process_status_label = tk.Label(
-        content,
-        text="KLAAR OM TE STARTEN" if waiting else "ACTIEF",
-        font=("Arial", 15, "bold"),
-        bg=BG,
-        fg=MUTED,
-    )
-    process_status_label.pack(pady=3)
-
-    row = tk.Frame(content, bg=BG)
-    row.pack(pady=5)
-
+    progress_canvas.pack(pady=(8, 6))
+    draw_progress()
+    process_motor_label = add_info(process_motor_text(), 16, TEXT)
     if waiting:
-        process_main_button = make_button(
-            row, "START STAP", start_process_step, width=13, bg=GREEN
-        )
+        status = "READY TO START"
+    elif run_paused:
+        status = "PAUSED"
     else:
-        process_main_button = make_button(
-            row, "PAUZE", toggle_process_pause, width=13, bg=ORANGE
-        )
-    process_main_button.pack(side=tk.LEFT, padx=7)
+        status = "RUNNING"
+    process_status_label = add_info(status, 15, ORANGE if run_paused else MUTED)
 
-    stop = make_button(row, "STOP PROCES", stop_process, width=13, bg=RED)
-    stop.pack(side=tk.LEFT, padx=7)
+    parent = begin_rows()
+    rows = [
+        add_row(parent, field("Speed", f"{run_recipe['speed']}%"), edit_run_speed, 18),
+    ]
+    pause_row = None
+    if waiting:
+        rows.append(add_row(parent, "START", start_process_step))
+    else:
+        pause_row = add_row(parent, "RESUME" if run_paused else "PAUSE", toggle_process_pause)
+        rows.append(pause_row)
+        rows.append(add_row(parent, "STOP", stop_process))
+    set_navigation(rows, 1)
 
-    set_navigation([process_main_button, stop])
+
+def draw_progress():
+    if progress_canvas is None:
+        return
+    try:
+        if not progress_canvas.winfo_exists():
+            return
+        width = 680
+        fraction = 0.0
+        if run_step_total > 0:
+            fraction = clamp(1.0 - (run_remaining / run_step_total), 0.0, 1.0)
+        color = ORANGE if 0 < run_remaining <= 10 else ACCENT
+        progress_canvas.delete("bar")
+        fill = int(width * fraction)
+        if fill > 0:
+            progress_canvas.create_rectangle(0, 0, fill, 18, fill=color, width=0, tags="bar")
+    except tk.TclError:
+        pass
 
 
 def process_motor_text():
-    if not motor.running:
-        direction = "UIT"
+    if motor is None or not motor.running:
+        arrow = "OFF"
     elif motor.direction == "LEFT":
-        direction = "◀"
+        arrow = "◀"
     else:
-        direction = "▶"
-
-    return (
-        f"Motor {direction}   {run_recipe['speed']}%   |   "
-        f"◀ {run_recipe['left_seconds']}s   ▶ {run_recipe['right_seconds']}s"
-    )
+        arrow = "▶"
+    speed = 0 if run_recipe is None else run_recipe["speed"]
+    return f"Motor {arrow}  {speed}%"
 
 
 def current_direction_duration():
@@ -1930,11 +1574,9 @@ def current_direction_duration():
 
 def start_process_step():
     global run_active, run_paused, run_last_tick, run_next_direction
-
     run_active = True
     run_paused = False
     run_last_tick = time.monotonic()
-
     step = run_recipe["steps"][run_step_index]
     if step.get("motor", True):
         motor.start(run_recipe["speed"], "LEFT")
@@ -1942,82 +1584,77 @@ def start_process_step():
     else:
         motor.stop()
         run_next_direction = None
-
     show_process_run_screen(waiting=False)
     process_tick()
 
 
 def process_tick():
     global run_remaining, run_last_tick, run_next_direction
-
     after_ids.pop("process_tick", None)
-    if not run_active:
+    if not run_active or run_paused:
+        if run_active:
+            schedule("process_tick", 50, process_tick)
         return
 
     now = time.monotonic()
+    elapsed = now - run_last_tick
+    run_last_tick = now
+    run_remaining -= elapsed
+    if run_remaining <= 0:
+        run_remaining = 0
+        finish_process_step()
+        return
 
-    if not run_paused:
-        elapsed = now - run_last_tick
-        run_last_tick = now
-        run_remaining -= elapsed
+    safe_config(
+        process_timer_label,
+        text=format_time(run_remaining),
+        fg=ORANGE if run_remaining <= 10 else ACCENT,
+    )
+    draw_progress()
 
-        if run_remaining <= 0:
-            run_remaining = 0
-            finish_process_step()
-            return
+    step = run_recipe["steps"][run_step_index]
+    if (
+        step.get("motor", True)
+        and run_next_direction
+        and now >= run_next_direction
+        and motor is not None
+        and not motor.switching
+    ):
+        if motor.direction == "LEFT":
+            direction = "RIGHT"
+            duration = run_recipe["right_seconds"]
+        else:
+            direction = "LEFT"
+            duration = run_recipe["left_seconds"]
+        motor.switch_direction(direction, lambda: safe_config(
+            process_motor_label, text=process_motor_text()
+        ))
+        run_next_direction = now + duration
 
-        safe_config(
-            process_timer_label,
-            text=format_time(run_remaining),
-            fg=ORANGE if run_remaining <= 10 else SELECT,
-        )
-
-        step = run_recipe["steps"][run_step_index]
-        if (
-            step.get("motor", True)
-            and run_next_direction
-            and now >= run_next_direction
-            and not motor.switching
-        ):
-            if motor.direction == "LEFT":
-                direction = "RIGHT"
-                duration = run_recipe["right_seconds"]
-            else:
-                direction = "LEFT"
-                duration = run_recipe["left_seconds"]
-
-            motor.switch_direction(direction, lambda: safe_config(
-                process_motor_label, text=process_motor_text()
-            ))
-            run_next_direction = now + duration
-
-        safe_config(process_motor_label, text=process_motor_text())
-
+    safe_config(process_motor_label, text=process_motor_text())
     schedule("process_tick", 50, process_tick)
 
 
 def toggle_process_pause():
     global run_paused, run_last_tick, run_next_direction, run_switch_remaining
-
     if not run_active:
         return
-
     run_paused = not run_paused
-
     if run_paused:
         if run_next_direction:
             run_switch_remaining = max(0.0, run_next_direction - time.monotonic())
         else:
             run_switch_remaining = None
         motor.stop()
-        safe_config(process_status_label, text="GEPAUZEERD", fg=ORANGE)
-        safe_config(process_main_button, text="VERDER", bg=GREEN)
+        safe_config(process_status_label, text="PAUSED", fg=ORANGE)
+        if pause_row is not None:
+            pause_row.text = "RESUME"
+        update_navigation()
         safe_config(process_motor_label, text=process_motor_text())
         return
 
     run_last_tick = time.monotonic()
     step = run_recipe["steps"][run_step_index]
-
     if step.get("motor", True):
         motor.start(run_recipe["speed"], motor.direction or "LEFT")
         remaining = run_switch_remaining
@@ -2026,9 +1663,10 @@ def toggle_process_pause():
         run_next_direction = time.monotonic() + remaining
     else:
         run_next_direction = None
-
-    safe_config(process_status_label, text="ACTIEF", fg=TEXT)
-    safe_config(process_main_button, text="PAUZE", bg=ORANGE)
+    safe_config(process_status_label, text="RUNNING", fg=MUTED)
+    if pause_row is not None:
+        pause_row.text = "PAUSE"
+    update_navigation()
     safe_config(process_motor_label, text=process_motor_text())
 
 
@@ -2046,58 +1684,50 @@ def process_has_next_step():
 
 
 def show_step_finished():
+    global current_screen, process_timer_label, progress_canvas, process_status_label
+    current_screen = "step_done"
     step = run_recipe["steps"][run_step_index]
     clear_screen()
-
-    tk.Label(
+    add_info(run_recipe["name"], 16, MUTED)
+    add_title(step["name"].upper(), 28)
+    process_timer_label = tk.Label(
         content,
-        text="✓ STAP KLAAR",
-        font=("Arial", 32, "bold"),
+        text="00:00",
+        font=(FONT, 58, "bold"),
         bg=BG,
-        fg=GREEN,
-    ).pack(pady=(55, 12))
-
-    tk.Label(
-        content,
-        text=step["name"].upper(),
-        font=("Arial", 26, "bold"),
-        bg=BG,
-        fg=TEXT,
-    ).pack(pady=5)
-
+        fg=ACCENT,
+    )
+    process_timer_label.pack(pady=(2, 0))
+    progress_canvas = tk.Canvas(
+        content, width=680, height=18, bg=TRACK, highlightthickness=0, bd=0,
+    )
+    progress_canvas.pack(pady=(8, 6))
+    draw_progress_full()
     if process_has_next_step():
-        next_step_data = run_recipe["steps"][run_step_index + 1]
-        tk.Label(
-            content,
-            text=f"Volgende:\n{next_step_data['name']}   {format_time(next_step_data['seconds'])}",
-            font=("Arial", 18),
-            bg=BG,
-            fg=MUTED,
-        ).pack(pady=15)
+        nxt = run_recipe["steps"][run_step_index + 1]
+        process_status_label = add_info("STEP DONE", 18, GREEN)
+        add_info(f"Next   {nxt['name']}   {format_time(nxt['seconds'])}", 15, MUTED)
+        parent = begin_rows()
+        set_navigation([
+            add_row(parent, "NEXT STEP", next_process_step),
+            add_row(parent, "STOP", stop_process),
+        ])
+    else:
+        process_status_label = add_info("PROCESS DONE", 18, ACCENT)
+        parent = begin_rows()
+        set_navigation([
+            add_row(parent, "DONE", show_main_menu),
+        ])
 
-        next_button = make_button(
-            content, "START VOLGENDE", next_process_step, width=18, bg=GREEN
-        )
-        next_button.pack(pady=7)
 
-        stop = make_button(
-            content, "STOP PROCES", stop_process, width=14, bg=RED, font_size=12
-        )
-        stop.pack(pady=3)
-        set_navigation([next_button, stop])
+def draw_progress_full():
+    if progress_canvas is None:
         return
-
-    tk.Label(
-        content,
-        text="PROCES VOLTOOID",
-        font=("Arial", 22, "bold"),
-        bg=BG,
-        fg=SELECT,
-    ).pack(pady=20)
-
-    done = make_button(content, "KLAAR", show_main_menu, width=14, bg=GREEN)
-    done.pack()
-    set_navigation([done])
+    try:
+        progress_canvas.delete("bar")
+        progress_canvas.create_rectangle(0, 0, 680, 18, fill=ACCENT, width=0, tags="bar")
+    except tk.TclError:
+        pass
 
 
 def next_process_step():
@@ -2115,70 +1745,117 @@ def stop_process():
     show_main_menu()
 
 
-def change_process_speed(steps):
+def edit_run_speed():
     if run_recipe is None:
         return
-    new_speed = int(
-        clamp(run_recipe["speed"] + (steps * settings["encoder_step"]), 0, 100)
+    open_adjust(
+        "Process speed",
+        run_recipe["speed"],
+        0,
+        100,
+        1,
+        save_run_speed,
+        lambda: show_process_run_screen(waiting=not run_active),
+        format_percent,
     )
-    run_recipe["speed"] = new_speed
-    motor.set_speed(new_speed)
-    safe_config(process_motor_label, text=process_motor_text())
 
 
-# ============================================================
-# ENCODER
-# ============================================================
+def save_run_speed(value):
+    if run_recipe is None:
+        show_main_menu()
+        return
+    run_recipe["speed"] = int(value)
+    motor.set_speed(value)
+    show_process_run_screen(waiting=not run_active)
 
-def setup_encoder_hardware():
-    global encoder_a, encoder_b, encoder_quad_state
-    global extra_ok_button, extra_back_button
 
-    if not HAS_GPIO:
-        encoder_a = DummyInputDevice()
-        encoder_b = DummyInputDevice()
-        extra_ok_button = DummyInputDevice()
-        extra_back_button = DummyInputDevice()
+def handle_ok():
+    if adjust_mode:
+        adjust_confirm()
+        return
+    if current_screen == "manual" and manual_active:
+        toggle_manual_motor()
+        return
+    if run_step_finished and current_screen == "step_done":
+        nav_activate()
+        return
+    nav_activate()
+
+
+def handle_back():
+    if adjust_mode:
+        adjust_cancel()
+        return
+    if choice_mode:
+        choice_cancel()
+        return
+    if current_screen == "manual":
+        leave_manual()
+        return
+    if current_screen in ("run", "step_done"):
+        stop_process()
+        return
+    if current_screen == "step":
+        show_process_editor()
+        return
+    if current_screen == "editor":
+        show_process_select()
+        return
+    if current_screen == "recipe":
+        show_process_select()
+        return
+    if current_screen == "processes":
+        show_main_menu()
+        return
+    if current_screen == "settings":
+        abandon_settings()
+        return
+
+
+def encoder_rotate(steps):
+    if not steps:
+        return
+    if adjust_mode:
+        adjust_change(steps)
+        return
+    if current_screen == "manual" and manual_active:
+        manual_speed_change(steps)
+        return
+    nav_move(steps)
+
+
+def setup_input_hardware():
+    global encoder_a, encoder_b, encoder_quad_state, ok_button, back_button, hardware_error
+
+    encoder_a = DummyInputDevice()
+    encoder_b = DummyInputDevice()
+    ok_button = DummyInputDevice()
+    back_button = DummyInputDevice()
+    if not HAS_GPIO or Button is None:
         return
 
     try:
-        encoder_a = DigitalInputDevice(
-            ENCODER_A_GPIO,
-            pull_up=True,
-            bounce_time=None,
-        )
-        encoder_b = DigitalInputDevice(
-            ENCODER_B_GPIO,
-            pull_up=True,
-            bounce_time=None,
-        )
-        extra_ok_button = Button(
-            EXTRA_OK_GPIO,
-            pull_up=True,
-            bounce_time=0.08,
-        )
-        extra_back_button = Button(
-            EXTRA_BACK_GPIO,
-            pull_up=True,
-            bounce_time=0.08,
-        )
-    except Exception:
+        encoder_a = DigitalInputDevice(ENCODER_A_GPIO, pull_up=True, bounce_time=None)
+        encoder_b = DigitalInputDevice(ENCODER_B_GPIO, pull_up=True, bounce_time=None)
+        encoder_quad_state = encoder_ab_state()
+        encoder_a.when_activated = on_encoder_edge
+        encoder_a.when_deactivated = on_encoder_edge
+        encoder_b.when_activated = on_encoder_edge
+        encoder_b.when_deactivated = on_encoder_edge
+    except Exception as error:
         encoder_a = DummyInputDevice()
         encoder_b = DummyInputDevice()
-        extra_ok_button = DummyInputDevice()
-        extra_back_button = DummyInputDevice()
-        return
+        hardware_error = hardware_error or f"Encoder: {error}"
 
-    encoder_quad_state = encoder_ab_state()
-
-    encoder_a.when_activated = on_encoder_edge
-    encoder_a.when_deactivated = on_encoder_edge
-
-    encoder_b.when_activated = on_encoder_edge
-    encoder_b.when_deactivated = on_encoder_edge
-
-    extra_ok_button.when_pressed = lambda: root.after(0, encoder_short_press)
-    extra_back_button.when_pressed = lambda: root.after(0, encoder_long_press)
+    try:
+        ok_button = Button(OK_GPIO, pull_up=True, bounce_time=0.08)
+        back_button = Button(BACK_GPIO, pull_up=True, bounce_time=0.08)
+        ok_button.when_pressed = lambda: root.after(0, handle_ok)
+        back_button.when_pressed = lambda: root.after(0, handle_back)
+    except Exception as error:
+        ok_button = DummyInputDevice()
+        back_button = DummyInputDevice()
+        hardware_error = hardware_error or f"Buttons: {error}"
 
 
 def encoder_ab_state():
@@ -2189,13 +1866,11 @@ def encoder_ab_state():
 
 def on_encoder_edge(*_args):
     global encoder_quad_state, encoder_quad_accum, pending_encoder_steps
-
     current = encoder_ab_state()
     delta = QUAD_DELTA.get((encoder_quad_state << 2) | current)
     encoder_quad_state = current
     if not delta:
         return
-
     with encoder_lock:
         encoder_quad_accum += delta
         steps = 0
@@ -2208,7 +1883,6 @@ def on_encoder_edge(*_args):
         if not steps:
             return
         pending_encoder_steps += steps
-
     schedule_encoder_flush()
 
 
@@ -2227,108 +1901,17 @@ def schedule_encoder_flush():
 
 def flush_encoder():
     global pending_encoder_steps, encoder_flush_scheduled
-
     with encoder_lock:
         steps = pending_encoder_steps
         pending_encoder_steps = 0
         encoder_flush_scheduled = False
-
     if steps:
         encoder_rotate(steps)
 
 
-def encoder_rotate(steps):
-    if not steps:
-        return
-
-    if adjust_mode:
-        adjust_change(steps)
-        return
-
-    if choice_mode:
-        choice_change(steps)
-        return
-
-    if root_screen_is_manual():
-        if manual_active:
-            manual_speed_change(steps)
-        else:
-            nav_move(steps)
-        return
-
-    if run_active:
-        change_process_speed(steps)
-        return
-
-    nav_move(steps)
-
-
-def encoder_short_press():
-    if adjust_mode:
-        adjust_confirm()
-        return
-
-    if choice_mode:
-        choice_confirm()
-        return
-
-    if root_screen_is_manual():
-        if manual_active:
-            toggle_manual_motor()
-        else:
-            nav_activate()
-        return
-
-    if run_active:
-        toggle_process_pause()
-        return
-
-    if run_step_finished:
-        if process_has_next_step():
-            next_process_step()
-        else:
-            show_main_menu()
-        return
-
-    nav_activate()
-
-
-def encoder_long_press():
-    if adjust_mode:
-        adjust_cancel()
-        return
-
-    if choice_mode:
-        choice_cancel()
-        return
-
-    if manual_active:
-        leave_manual()
-        return
-
-    if run_active:
-        stop_process()
-        return
-
-    show_main_menu()
-
-
-def root_screen_is_manual():
-    try:
-        return manual_start_button is not None and manual_start_button.winfo_exists()
-    except Exception:
-        return False
-
-
-# ============================================================
-# CLOSE
-# ============================================================
-
 def close_hardware():
     global temp_thread
-
     shutdown_event.set()
-
     for device in (encoder_a, encoder_b):
         if device is None:
             continue
@@ -2337,31 +1920,22 @@ def close_hardware():
             device.when_deactivated = None
         except Exception:
             pass
-
-    for device in (extra_ok_button, extra_back_button):
+    for device in (ok_button, back_button):
         if device is None:
             continue
         try:
             device.when_pressed = None
         except Exception:
             pass
-
     if temp_thread is not None and temp_thread.is_alive():
         temp_thread.join(timeout=1.2)
     temp_thread = None
-
     if motor is not None:
         try:
             motor.close()
         except Exception:
             pass
-
-    for device in (
-        encoder_a,
-        encoder_b,
-        extra_ok_button,
-        extra_back_button,
-    ):
+    for device in (encoder_a, encoder_b, ok_button, back_button):
         if device is not None:
             try:
                 device.close()
@@ -2380,63 +1954,177 @@ def close_app():
         pass
 
 
-# ============================================================
-# START
-# ============================================================
+def shutdown_pi():
+    stop_all_activity()
+    for key in list(after_ids):
+        cancel_after(key)
+    close_hardware()
+
+    for path in ("/usr/sbin/shutdown", "/sbin/shutdown"):
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            os.execv(path, ["shutdown", "-h", "now"])
+
+    os.execvp("shutdown", ["shutdown", "-h", "now"])
+
+
+def attach_xauthority():
+    current = os.environ.get("XAUTHORITY")
+    if current and Path(current).is_file():
+        return
+
+    candidates = []
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user and pwd is not None:
+        try:
+            candidates.append(Path(pwd.getpwnam(sudo_user).pw_dir) / ".Xauthority")
+        except Exception:
+            pass
+    candidates.append(Path.home() / ".Xauthority")
+
+    runtime = Path("/run/user")
+    if runtime.is_dir():
+        try:
+            for folder in runtime.iterdir():
+                if not folder.is_dir():
+                    continue
+                for path in folder.iterdir():
+                    if path.is_file() and "auth" in path.name.lower():
+                        candidates.append(path)
+        except Exception:
+            pass
+
+    for path in candidates:
+        try:
+            if path.is_file():
+                os.environ["XAUTHORITY"] = str(path)
+                return
+        except Exception:
+            continue
+
+
+def first_x_socket():
+    folder = Path("/tmp/.X11-unix")
+    if not folder.is_dir():
+        return None
+    sockets = []
+    try:
+        for path in folder.iterdir():
+            number = path.name[1:]
+            if path.name.startswith("X") and number.isdigit():
+                sockets.append(path)
+    except Exception:
+        return None
+    if not sockets:
+        return None
+    requested = os.environ.get("DISPLAY", "")
+    if requested.startswith(":"):
+        number = requested[1:].split(".")[0]
+        for path in sockets:
+            if path.name == f"X{number}":
+                return path
+    return sorted(sockets, key=lambda path: path.name)[0]
+
+
+def relaunch_with_xinit():
+    if os.environ.get("JOBO_XINIT") == "1":
+        return False
+    xinit = shutil.which("xinit")
+    if not xinit:
+        return False
+    env = os.environ.copy()
+    env["JOBO_XINIT"] = "1"
+    env.pop("DISPLAY", None)
+    script = os.path.abspath(__file__)
+    try:
+        os.execve(
+            xinit,
+            [xinit, sys.executable, script, "--", ":0", "-nocursor"],
+            env,
+        )
+    except OSError:
+        return False
+    return True
+
+
+def prepare_display():
+    attach_xauthority()
+    socket = first_x_socket()
+    if socket is not None:
+        os.environ["DISPLAY"] = f":{socket.name[1:]}"
+        return
+    if relaunch_with_xinit():
+        return
+    sys.stderr.write(
+        "No graphical display found.\n"
+        "Tkinter cannot draw on DISPLAY=:0 because no X server is running there.\n"
+        "That happens on Raspberry Pi OS Lite and on a Wayland desktop.\n\n"
+        "Install once:\n"
+        "  sudo apt install xserver-xorg xinit\n\n"
+        "Then start, without DISPLAY=:0:\n"
+        "  sudo python3 jobo-motor.py\n"
+    )
+    raise SystemExit(1)
+
 
 def create_root():
     global root, content, temp_label
-
-    root = tk.Tk()
+    prepare_display()
+    try:
+        root = tk.Tk()
+    except tk.TclError as error:
+        message = str(error).lower()
+        if "connect" in message and relaunch_with_xinit():
+            return
+        sys.stderr.write(
+            "Tkinter could not open the display.\n"
+            f"{error}\n\n"
+            "Start without a forced display:\n"
+            "  sudo python3 jobo-motor.py\n"
+        )
+        raise SystemExit(1)
     root.title("JOBO Film Processor")
     root.geometry(f"{WIDTH}x{HEIGHT}")
     root.configure(bg=BG)
     root.protocol("WM_DELETE_WINDOW", close_app)
-    root.bind("<Escape>", lambda event: close_app())
-
     if ON_PI:
         root.attributes("-fullscreen", True)
+        root.config(cursor="none")
 
-    header = tk.Frame(root, bg=BG)
-    header.pack(fill=tk.X, pady=(6, 0))
-
-    tk.Label(
-        header,
-        text="JOBO",
-        font=("Arial", 12, "bold"),
-        bg=BG,
-        fg=MUTED,
-    ).pack(side=tk.LEFT, padx=16)
-
+    header = tk.Frame(root, bg=BG, height=42)
+    header.pack(fill=tk.X)
+    header.pack_propagate(False)
     temp_label = tk.Label(
         header,
         text="Temp. --.-°C",
-        font=("Arial", 14, "bold"),
+        font=(FONT, 18, "bold"),
         bg=BG,
-        fg="white",
+        fg=TEXT,
+        anchor="w",
     )
-    temp_label.pack(side=tk.RIGHT, padx=16)
+    temp_label.pack(fill=tk.BOTH, expand=True, padx=36, pady=(8, 0))
 
     content = tk.Frame(root, bg=BG)
     content.pack(fill=tk.BOTH, expand=True)
+
+    root.bind("<Up>", lambda _event: encoder_rotate(-1))
+    root.bind("<Down>", lambda _event: encoder_rotate(1))
+    root.bind("<Return>", lambda _event: handle_ok())
+    root.bind("<KP_Enter>", lambda _event: handle_ok())
+    root.bind("<BackSpace>", lambda _event: handle_back())
+    root.bind("<Escape>", lambda _event: handle_back())
+    root.focus_set()
 
 
 def start_background():
     global temp_thread
     shutdown_event.clear()
-    temp_thread = threading.Thread(
-        target=temperature_loop,
-        name="temperature",
-        daemon=True,
-    )
+    temp_thread = threading.Thread(target=temperature_loop, name="temperature", daemon=True)
     temp_thread.start()
 
 
 def main():
     global motor, simulated_hardware, hardware_error
-
     create_root()
-
     try:
         if not HAS_GPIO or not ON_PI:
             simulated_hardware = True
@@ -2444,14 +2132,13 @@ def main():
         else:
             motor = MotorController(simulated=False)
     except Exception as error:
-        hardware_error = error
+        hardware_error = str(error)
         simulated_hardware = True
         motor = MotorController(simulated=True)
 
-    setup_encoder_hardware()
+    setup_input_hardware()
     show_main_menu()
     start_background()
-
     try:
         root.mainloop()
     finally:
