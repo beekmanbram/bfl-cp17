@@ -1960,16 +1960,11 @@ def shutdown_pi():
         cancel_after(key)
     close_hardware()
 
-    # -P is poweroff. -h only halts, and a Pi 4 then boots again.
     for path in ("/usr/sbin/shutdown", "/sbin/shutdown"):
         if os.path.isfile(path) and os.access(path, os.X_OK):
-            os.execv(path, ["shutdown", "-P", "now"])
+            os.execv(path, ["shutdown", "-h", "now"])
 
-    for path in ("/usr/sbin/poweroff", "/sbin/poweroff"):
-        if os.path.isfile(path) and os.access(path, os.X_OK):
-            os.execv(path, ["poweroff"])
-
-    os.execvp("shutdown", ["shutdown", "-P", "now"])
+    os.execvp("shutdown", ["shutdown", "-h", "now"])
 
 
 def attach_xauthority():
