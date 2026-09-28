@@ -1,6 +1,7 @@
 import copy
 import json
 import os
+import shutil
 import sys
 import threading
 import time
@@ -1953,9 +1954,121 @@ def close_app():
         pass
 
 
+def attach_xauthority():
+    current = os.environ.get("XAUTHORITY")
+    if current and Path(current).is_file():
+        return
+
+    candidates = []
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user and pwd is not None:
+        try:
+            candidates.append(Path(pwd.getpwnam(sudo_user).pw_dir) / ".Xauthority")
+        except Exception:
+            pass
+    candidates.append(Path.home() / ".Xauthority")
+
+    runtime = Path("/run/user")
+    if runtime.is_dir():
+        try:
+            for folder in runtime.iterdir():
+                if not folder.is_dir():
+                    continue
+                for path in folder.iterdir():
+                    if path.is_file() and "auth" in path.name.lower():
+                        candidates.append(path)
+        except Exception:
+            pass
+
+    for path in candidates:
+        try:
+            if path.is_file():
+                os.environ["XAUTHORITY"] = str(path)
+                return
+        except Exception:
+            continue
+
+
+def first_x_socket():
+    folder = Path("/tmp/.X11-unix")
+    if not folder.is_dir():
+        return None
+    sockets = []
+    try:
+        for path in folder.iterdir():
+            number = path.name[1:]
+            if path.name.startswith("X") and number.isdigit():
+                sockets.append(path)
+    except Exception:
+        return None
+    if not sockets:
+        return None
+    requested = os.environ.get("DISPLAY", "")
+    if requested.startswith(":"):
+        number = requested[1:].split(".")[0]
+        for path in sockets:
+            if path.name == f"X{number}":
+                return path
+    return sorted(sockets, key=lambda path: path.name)[0]
+
+
+def relaunch_with_xinit():
+    if os.environ.get("JOBO_XINIT") == "1":
+        return False
+    xinit = shutil.which("xinit")
+    if not xinit:
+        return False
+    env = os.environ.copy()
+    env["JOBO_XINIT"] = "1"
+    env.pop("DISPLAY", None)
+    script = os.path.abspath(__file__)
+    try:
+        os.execve(
+            xinit,
+            [xinit, sys.executable, script, "--", ":0", "-nocursor"],
+            env,
+        )
+    except OSError:
+        return False
+    return True
+
+
+def prepare_display():
+    attach_xauthority()
+    socket = first_x_socket()
+    if socket is not None:
+        os.environ["DISPLAY"] = f":{socket.name[1:]}"
+        return
+    if relaunch_with_xinit():
+        return
+    sys.stderr.write(
+        "Geen grafisch scherm gevonden.\n"
+        "Tkinter kan niet op DISPLAY=:0 tekenen omdat daar geen X-server draait.\n"
+        "Dat gebeurt op Raspberry Pi OS Lite en op een Wayland-bureaublad.\n\n"
+        "Eenmalig installeren:\n"
+        "  sudo apt install xserver-xorg xinit\n\n"
+        "Daarna starten, zonder DISPLAY=:0:\n"
+        "  sudo python3 jobo-motor.py\n"
+    )
+    raise SystemExit(1)
+
+
 def create_root():
     global root, content, temp_label
-    root = tk.Tk()
+    prepare_display()
+    try:
+        root = tk.Tk()
+    except tk.TclError as error:
+        message = str(error).lower()
+        if "connect" in message and relaunch_with_xinit():
+            return
+        sys.stderr.write(
+            "Tkinter kon het scherm niet openen.\n"
+            f"{error}\n\n"
+            "Start zonder geforceerd display:\n"
+            "  sudo python3 jobo-motor.py\n"
+        )
+        raise SystemExit(1)
     root.title("JOBO Film Processor")
     root.geometry(f"{WIDTH}x{HEIGHT}")
     root.configure(bg=BG)
