@@ -1,6 +1,9 @@
 import os
+import re
 import shutil
+import subprocess
 import sys
+import time
 import tkinter as tk
 from pathlib import Path
 from PIL import Image, ImageTk
@@ -112,7 +115,66 @@ def prepare_display():
     raise SystemExit(1)
 
 
+def rotate_display_left():
+    """Same rotation as start-cp17.sh: portrait, HDMI turned left."""
+    env = os.environ.copy()
+    env["DISPLAY"] = os.environ.get("DISPLAY", ":0")
+    output = None
+
+    for _ in range(50):
+        try:
+            query = subprocess.run(
+                ["xrandr", "--query"],
+                capture_output=True,
+                text=True,
+                env=env,
+                check=False,
+            )
+        except Exception:
+            return None
+        for line in query.stdout.splitlines():
+            if " connected" in line:
+                output = line.split()[0]
+                break
+        if output:
+            break
+        time.sleep(0.1)
+
+    if not output:
+        return None
+
+    subprocess.run(
+        ["xrandr", "--output", output, "--rotate", "left"],
+        env=env,
+        check=False,
+    )
+    for command in (
+        ["xset", "s", "off"],
+        ["xset", "-dpms"],
+        ["xset", "s", "noblank"],
+    ):
+        try:
+            subprocess.run(command, env=env, check=False)
+        except Exception:
+            pass
+
+    query = subprocess.run(
+        ["xrandr", "--query"],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+    for line in query.stdout.splitlines():
+        if output in line and " connected" in line:
+            match = re.search(r"(\d+)x(\d+)", line)
+            if match:
+                return int(match.group(1)), int(match.group(2))
+    return None
+
+
 prepare_display()
+rotated_size = rotate_display_left()
 
 try:
     root = tk.Tk()
@@ -129,17 +191,20 @@ except tk.TclError as error:
     raise SystemExit(1)
 
 root.configure(bg="black")
-root.attributes("-fullscreen", True)
 root.config(cursor="none")
+root.attributes("-fullscreen", True)
+root.update_idletasks()
 
-screen_w = root.winfo_screenwidth()
-screen_h = root.winfo_screenheight()
+if rotated_size:
+    screen_w, screen_h = rotated_size
+else:
+    screen_w = root.winfo_screenwidth()
+    screen_h = root.winfo_screenheight()
+
+root.geometry(f"{screen_w}x{screen_h}+0+0")
 
 image = Image.open(LOGO).convert("RGBA")
-
-# Logo passend maken met behoud van verhouding
 image.thumbnail((screen_w, screen_h), Image.Resampling.LANCZOS)
-
 photo = ImageTk.PhotoImage(image)
 
 label = tk.Label(
@@ -147,9 +212,9 @@ label = tk.Label(
     image=photo,
     bg="black",
     borderwidth=0,
-    highlightthickness=0
+    highlightthickness=0,
 )
-label.place(relx=0.5, rely=0.5, anchor="center")
+label.place(x=screen_w // 2, y=screen_h // 2, anchor="center")
 
 
 def start_jobo():
