@@ -1961,10 +1961,15 @@ def shutdown_pi():
         cancel_after(key)
     close_hardware()
 
-    # Same command that powers the Pi off from a terminal.
-    # Do not replace this process: that ends the X session before shutdown runs.
+    # Same command as in the terminal. -n means: never wait for a password.
+    # Passwordless sudo for this command is installed once on the Pi.
+    if os.geteuid() == 0:
+        command = ["/usr/sbin/shutdown", "-h", "now"]
+    else:
+        command = ["sudo", "-n", "/usr/sbin/shutdown", "-h", "now"]
+
     subprocess.Popen(
-        ["sudo", "shutdown", "-h", "now"],
+        command,
         start_new_session=True,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
