@@ -2,6 +2,7 @@ import copy
 import json
 import os
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -29,17 +30,17 @@ except ImportError:
 # INA1 -> GPIO6   (physical 31)
 # INB1 -> GPIO13  (physical 33)
 #
-# Encoder, alleen draaien
+# Encoder, rotation only
 # A -> GPIO16
 # B -> GPIO20
-# GPIO21 is vrij. De drukfunctie van de encoder wordt niet gebruikt.
+# GPIO21 is unused. The encoder push button is not used.
 #
-# Losse knoppen naar GND, interne pull-up
-# OK    -> GPIO23
-# TERUG -> GPIO24
+# Separate buttons to GND, internal pull-up
+# OK   -> GPIO23
+# BACK -> GPIO24
 #
 # DS18B20 DATA -> GPIO4
-# Scherm 800x480, geen touch
+# Screen 800x480, no touch
 # ============================================================
 
 
@@ -153,7 +154,7 @@ DEFAULT_SETTINGS = {
 
 DEFAULT_RECIPES = [
     {
-        "name": "B&W voorbeeld",
+        "name": "B&W example",
         "speed": 30,
         "left_seconds": 10.0,
         "right_seconds": 10.0,
@@ -284,7 +285,7 @@ def normalize_step(step):
     return {"name": name, "seconds": seconds, "motor": bool(step.get("motor", True))}
 
 
-def normalize_recipe(recipe, fallback_name="Proces"):
+def normalize_recipe(recipe, fallback_name="Process"):
     if not isinstance(recipe, dict):
         recipe = {}
     steps = recipe.get("steps")
@@ -319,7 +320,7 @@ def normalize_recipes(data):
     if not isinstance(data, list) or not data:
         return copy.deepcopy(DEFAULT_RECIPES)
     recipes_data = [
-        normalize_recipe(recipe, f"Proces {index + 1}")
+        normalize_recipe(recipe, f"Process {index + 1}")
         for index, recipe in enumerate(data)
     ]
     return recipes_data or copy.deepcopy(DEFAULT_RECIPES)
@@ -357,7 +358,7 @@ class HardwarePWM:
             except Exception:
                 continue
         raise RuntimeError(
-            "Hardware PWM niet gevonden. Controleer dtoverlay=pwm,pin=12,func=4"
+            "Hardware PWM not found. Check dtoverlay=pwm,pin=12,func=4"
         )
 
     def export(self):
@@ -371,7 +372,7 @@ class HardwarePWM:
             if self.pwm.exists():
                 return
             time.sleep(0.02)
-        raise RuntimeError("PWM kanaal kon niet worden aangemaakt.")
+        raise RuntimeError("PWM channel could not be created.")
 
     @staticmethod
     def write(path, value):
@@ -880,7 +881,7 @@ def open_adjust(title, value, minimum, maximum, step, callback, cancel_callback,
     parent = begin_rows()
     set_navigation([
         add_row(parent, "OK", adjust_confirm),
-        add_row(parent, "ANNULEREN", adjust_cancel),
+        add_row(parent, "CANCEL", adjust_cancel),
     ])
 
 
@@ -965,13 +966,13 @@ def show_main_menu():
     if hardware_error:
         add_info(str(hardware_error), 13, RED)
     elif simulated_hardware and ON_PI:
-        add_info("Motor in simulatie", 13, ORANGE)
+        add_info("Motor in simulation", 13, ORANGE)
     parent = begin_rows()
     set_navigation([
-        add_row(parent, "ONTWIKKELEN", enter_manual),
-        add_row(parent, "PROCESSEN", show_process_select),
-        add_row(parent, "INSTELLINGEN", enter_settings),
-        add_row(parent, "AFSLUITEN", close_app),
+        add_row(parent, "DEVELOP", enter_manual),
+        add_row(parent, "PROCESSES", show_process_select),
+        add_row(parent, "SETTINGS", enter_settings),
+        add_row(parent, "SHUTDOWN", shutdown_pi),
     ])
 
 
@@ -987,21 +988,21 @@ def show_settings():
     choice_mode = False
     current_screen = "settings"
     clear_screen()
-    add_title("INSTELLINGEN")
+    add_title("SETTINGS")
     parent = begin_rows()
     set_navigation([
-        add_row(parent, field("Snelheid", f"{settings['speed']}%"), settings_speed, 18),
-        add_row(parent, field("Links tijd", format_seconds(settings["left_seconds"])), settings_left, 18),
-        add_row(parent, field("Rechts tijd", format_seconds(settings["right_seconds"])), settings_right, 18),
-        add_row(parent, field("Richtingswissel", format_ms(settings["direction_delay_ms"])), settings_delay, 18),
-        add_row(parent, field("Encoder stap", f"{settings['encoder_step']}%"), settings_encoder_step, 18),
-        add_row(parent, "OPSLAAN & TERUG", save_settings_and_back, 18),
+        add_row(parent, field("Speed", f"{settings['speed']}%"), settings_speed, 18),
+        add_row(parent, field("Left time", format_seconds(settings["left_seconds"])), settings_left, 18),
+        add_row(parent, field("Right time", format_seconds(settings["right_seconds"])), settings_right, 18),
+        add_row(parent, field("Turn delay", format_ms(settings["direction_delay_ms"])), settings_delay, 18),
+        add_row(parent, field("Encoder step", f"{settings['encoder_step']}%"), settings_encoder_step, 18),
+        add_row(parent, "SAVE & BACK", save_settings_and_back, 18),
     ])
 
 
 def settings_speed():
     open_adjust(
-        "Standaard snelheid", settings["speed"], 0, 100, 1,
+        "Default speed", settings["speed"], 0, 100, 1,
         save_setting_speed, show_settings, format_percent,
     )
 
@@ -1013,7 +1014,7 @@ def save_setting_speed(value):
 
 def settings_left():
     open_adjust(
-        "Links tijd", settings["left_seconds"], 0.5, 60, 0.5,
+        "Left time", settings["left_seconds"], 0.5, 60, 0.5,
         save_setting_left, show_settings, format_seconds,
     )
 
@@ -1025,7 +1026,7 @@ def save_setting_left(value):
 
 def settings_right():
     open_adjust(
-        "Rechts tijd", settings["right_seconds"], 0.5, 60, 0.5,
+        "Right time", settings["right_seconds"], 0.5, 60, 0.5,
         save_setting_right, show_settings, format_seconds,
     )
 
@@ -1037,7 +1038,7 @@ def save_setting_right(value):
 
 def settings_delay():
     open_adjust(
-        "Richtingswissel", settings["direction_delay_ms"], 20, 500, 10,
+        "Turn delay", settings["direction_delay_ms"], 20, 500, 10,
         save_setting_delay, show_settings, format_ms,
     )
 
@@ -1049,7 +1050,7 @@ def save_setting_delay(value):
 
 def settings_encoder_step():
     open_adjust(
-        "Encoder stap", settings["encoder_step"], 1, 10, 1,
+        "Encoder step", settings["encoder_step"], 1, 10, 1,
         save_setting_encoder, show_settings, format_percent,
     )
 
@@ -1090,19 +1091,19 @@ def render_manual():
     choice_mode = False
     current_screen = "manual"
     clear_screen()
-    add_title("ONTWIKKELEN")
+    add_title("DEVELOP")
     manual_motor_label = add_info(manual_status_text(), 18, TEXT)
     parent = begin_rows()
-    speed_row = add_row(parent, field("Snelheid", f"{manual_speed}%"), edit_manual_speed, 18)
+    speed_row = add_row(parent, field("Speed", f"{manual_speed}%"), edit_manual_speed, 18)
     left_row = add_row(
-        parent, field("Links tijd", format_seconds(settings["left_seconds"])), edit_manual_left, 18
+        parent, field("Left time", format_seconds(settings["left_seconds"])), edit_manual_left, 18
     )
     right_row = add_row(
-        parent, field("Rechts tijd", format_seconds(settings["right_seconds"])), edit_manual_right, 18
+        parent, field("Right time", format_seconds(settings["right_seconds"])), edit_manual_right, 18
     )
     action = "STOP" if manual_active else "START"
     action_row = add_row(parent, action, toggle_manual_motor, 18)
-    back_row = add_row(parent, "TERUG", leave_manual, 18)
+    back_row = add_row(parent, "BACK", leave_manual, 18)
     manual_rows = {
         "speed": speed_row,
         "left": left_row,
@@ -1114,15 +1115,15 @@ def render_manual():
 
 def manual_status_text():
     if not manual_active or motor is None or not motor.running:
-        return "Motor           UIT"
+        return "Motor           OFF"
     if motor.direction == "LEFT":
-        return "Motor           ◀ LINKS"
-    return "Motor           RECHTS ▶"
+        return "Motor           ◀ LEFT"
+    return "Motor           RIGHT ▶"
 
 
 def refresh_manual_rows():
     if "speed" in manual_rows:
-        manual_rows["speed"].text = field("Snelheid", f"{manual_speed}%")
+        manual_rows["speed"].text = field("Speed", f"{manual_speed}%")
     if "action" in manual_rows:
         manual_rows["action"].text = "STOP" if manual_active else "START"
     safe_config(manual_motor_label, text=manual_status_text(), fg=ACCENT if manual_active else TEXT)
@@ -1133,7 +1134,7 @@ def edit_manual_speed():
     if manual_active:
         return
     open_adjust(
-        "Snelheid", manual_speed, 0, 100, 1,
+        "Speed", manual_speed, 0, 100, 1,
         save_manual_speed, render_manual, format_percent,
     )
 
@@ -1148,7 +1149,7 @@ def edit_manual_left():
     if manual_active:
         return
     open_adjust(
-        "Links tijd", settings["left_seconds"], 0.5, 60, 0.5,
+        "Left time", settings["left_seconds"], 0.5, 60, 0.5,
         save_manual_left, render_manual, format_seconds,
     )
 
@@ -1163,7 +1164,7 @@ def edit_manual_right():
     if manual_active:
         return
     open_adjust(
-        "Rechts tijd", settings["right_seconds"], 0.5, 60, 0.5,
+        "Right time", settings["right_seconds"], 0.5, 60, 0.5,
         save_manual_right, render_manual, format_seconds,
     )
 
@@ -1239,13 +1240,13 @@ def show_process_select():
     choice_mode = False
     current_screen = "processes"
     clear_screen()
-    add_title("PROCESSEN")
+    add_title("PROCESSES")
     parent = begin_rows()
     rows = []
     for index, recipe in enumerate(recipes):
         rows.append(add_row(parent, recipe["name"], lambda i=index: open_recipe(i), 20))
-    rows.append(add_row(parent, "+ NIEUW", add_recipe, 20))
-    rows.append(add_row(parent, "TERUG", show_main_menu, 20))
+    rows.append(add_row(parent, "+ NEW", add_recipe, 20))
+    rows.append(add_row(parent, "BACK", show_main_menu, 20))
     selected = min(current_recipe_index, len(rows) - 1)
     set_navigation(rows, selected)
 
@@ -1263,20 +1264,20 @@ def show_recipe_actions():
     recipe = recipes[current_recipe_index]
     clear_screen()
     add_title(recipe["name"])
-    add_info(f"{len(recipe['steps'])} stappen   {recipe['speed']}%", 15, MUTED)
+    add_info(f"{len(recipe['steps'])} steps   {recipe['speed']}%", 15, MUTED)
     parent = begin_rows()
     set_navigation([
-        add_row(parent, "START PROCES", start_selected_recipe),
-        add_row(parent, "BEWERK", edit_selected_recipe),
-        add_row(parent, "VERWIJDER", delete_recipe),
-        add_row(parent, "TERUG", show_process_select),
+        add_row(parent, "START PROCESS", start_selected_recipe),
+        add_row(parent, "EDIT", edit_selected_recipe),
+        add_row(parent, "DELETE", delete_recipe),
+        add_row(parent, "BACK", show_process_select),
     ])
 
 
 def add_recipe():
     global current_recipe_index, editor_recipe_index, editor_step_index
     recipe = {
-        "name": f"Proces {len(recipes) + 1}",
+        "name": f"Process {len(recipes) + 1}",
         "speed": settings["speed"],
         "left_seconds": settings["left_seconds"],
         "right_seconds": settings["right_seconds"],
@@ -1321,29 +1322,29 @@ def show_process_editor():
     clear_screen()
     add_title(recipe["name"], 24)
     add_info(
-        f"Stap {editor_step_index + 1}/{len(recipe['steps'])}    "
+        f"Step {editor_step_index + 1}/{len(recipe['steps'])}    "
         f"{step['name']}    {format_time(step['seconds'])}",
         16,
         ACCENT,
     )
     parent = begin_rows()
     set_navigation([
-        add_row(parent, field("Snelheid", f"{recipe['speed']}%"), edit_recipe_speed, 17),
-        add_row(parent, field("Links", format_seconds(recipe["left_seconds"])), edit_recipe_left, 17),
-        add_row(parent, field("Rechts", format_seconds(recipe["right_seconds"])), edit_recipe_right, 17),
-        add_row(parent, "VORIGE STAP", previous_step, 17),
-        add_row(parent, "VOLGENDE STAP", next_step, 17),
-        add_row(parent, "BEWERK STAP", show_step_editor, 17),
-        add_row(parent, "+ STAP", add_step, 17),
-        add_row(parent, "- STAP", delete_step, 17),
-        add_row(parent, "OPSLAAN", save_process, 17),
-        add_row(parent, "TERUG", show_process_select, 17),
+        add_row(parent, field("Speed", f"{recipe['speed']}%"), edit_recipe_speed, 17),
+        add_row(parent, field("Left", format_seconds(recipe["left_seconds"])), edit_recipe_left, 17),
+        add_row(parent, field("Right", format_seconds(recipe["right_seconds"])), edit_recipe_right, 17),
+        add_row(parent, "PREVIOUS STEP", previous_step, 17),
+        add_row(parent, "NEXT STEP", next_step, 17),
+        add_row(parent, "EDIT STEP", show_step_editor, 17),
+        add_row(parent, "+ STEP", add_step, 17),
+        add_row(parent, "- STEP", delete_step, 17),
+        add_row(parent, "SAVE", save_process, 17),
+        add_row(parent, "BACK", show_process_select, 17),
     ])
 
 
 def edit_recipe_speed():
     open_adjust(
-        "Proces snelheid", current_editor_recipe()["speed"], 0, 100, 1,
+        "Process speed", current_editor_recipe()["speed"], 0, 100, 1,
         save_recipe_speed, show_process_editor, format_percent,
     )
 
@@ -1355,7 +1356,7 @@ def save_recipe_speed(value):
 
 def edit_recipe_left():
     open_adjust(
-        "Links tijd", current_editor_recipe()["left_seconds"], 0.5, 60, 0.5,
+        "Left time", current_editor_recipe()["left_seconds"], 0.5, 60, 0.5,
         save_recipe_left, show_process_editor, format_seconds,
     )
 
@@ -1367,7 +1368,7 @@ def save_recipe_left(value):
 
 def edit_recipe_right():
     open_adjust(
-        "Rechts tijd", current_editor_recipe()["right_seconds"], 0.5, 60, 0.5,
+        "Right time", current_editor_recipe()["right_seconds"], 0.5, 60, 0.5,
         save_recipe_right, show_process_editor, format_seconds,
     )
 
@@ -1425,20 +1426,20 @@ def show_step_editor():
     current_screen = "step"
     step = current_step()
     clear_screen()
-    add_title(f"STAP {editor_step_index + 1}")
+    add_title(f"STEP {editor_step_index + 1}")
     parent = begin_rows()
-    motor_text = "AAN" if step.get("motor", True) else "UIT"
+    motor_text = "ON" if step.get("motor", True) else "OFF"
     set_navigation([
-        add_row(parent, field("Naam", step["name"]), edit_step_name, 18),
-        add_row(parent, field("Tijd", format_time(step["seconds"])), edit_step_time, 18),
+        add_row(parent, field("Name", step["name"]), edit_step_name, 18),
+        add_row(parent, field("Time", format_time(step["seconds"])), edit_step_time, 18),
         add_row(parent, field("Motor", motor_text), toggle_step_motor, 18),
-        add_row(parent, "KLAAR", show_process_editor, 18),
-        add_row(parent, "TERUG", show_process_editor, 18),
+        add_row(parent, "DONE", show_process_editor, 18),
+        add_row(parent, "BACK", show_process_editor, 18),
     ])
 
 
 def edit_step_name():
-    open_choice("Stapnaam", STEP_NAMES, current_step()["name"], save_step_name, show_step_editor)
+    open_choice("Step name", STEP_NAMES, current_step()["name"], save_step_name, show_step_editor)
 
 
 def save_step_name(value):
@@ -1448,7 +1449,7 @@ def save_step_name(value):
 
 def edit_step_time():
     open_adjust(
-        "Stapduur", current_step()["seconds"], 1, 3600, 5,
+        "Step duration", current_step()["seconds"], 1, 3600, 5,
         save_step_time, show_step_editor, format_time,
     )
 
@@ -1515,22 +1516,22 @@ def show_process_run_screen(waiting=False):
     draw_progress()
     process_motor_label = add_info(process_motor_text(), 16, TEXT)
     if waiting:
-        status = "KLAAR OM TE STARTEN"
+        status = "READY TO START"
     elif run_paused:
-        status = "GEPAUZEERD"
+        status = "PAUSED"
     else:
-        status = "ACTIEF"
+        status = "RUNNING"
     process_status_label = add_info(status, 15, ORANGE if run_paused else MUTED)
 
     parent = begin_rows()
     rows = [
-        add_row(parent, field("Snelheid", f"{run_recipe['speed']}%"), edit_run_speed, 18),
+        add_row(parent, field("Speed", f"{run_recipe['speed']}%"), edit_run_speed, 18),
     ]
     pause_row = None
     if waiting:
         rows.append(add_row(parent, "START", start_process_step))
     else:
-        pause_row = add_row(parent, "VERDER" if run_paused else "PAUZE", toggle_process_pause)
+        pause_row = add_row(parent, "RESUME" if run_paused else "PAUSE", toggle_process_pause)
         rows.append(pause_row)
         rows.append(add_row(parent, "STOP", stop_process))
     set_navigation(rows, 1)
@@ -1557,7 +1558,7 @@ def draw_progress():
 
 def process_motor_text():
     if motor is None or not motor.running:
-        arrow = "UIT"
+        arrow = "OFF"
     elif motor.direction == "LEFT":
         arrow = "◀"
     else:
@@ -1646,9 +1647,9 @@ def toggle_process_pause():
         else:
             run_switch_remaining = None
         motor.stop()
-        safe_config(process_status_label, text="GEPAUZEERD", fg=ORANGE)
+        safe_config(process_status_label, text="PAUSED", fg=ORANGE)
         if pause_row is not None:
-            pause_row.text = "VERDER"
+            pause_row.text = "RESUME"
         update_navigation()
         safe_config(process_motor_label, text=process_motor_text())
         return
@@ -1663,9 +1664,9 @@ def toggle_process_pause():
         run_next_direction = time.monotonic() + remaining
     else:
         run_next_direction = None
-    safe_config(process_status_label, text="ACTIEF", fg=MUTED)
+    safe_config(process_status_label, text="RUNNING", fg=MUTED)
     if pause_row is not None:
-        pause_row.text = "PAUZE"
+        pause_row.text = "PAUSE"
     update_navigation()
     safe_config(process_motor_label, text=process_motor_text())
 
@@ -1705,18 +1706,18 @@ def show_step_finished():
     draw_progress_full()
     if process_has_next_step():
         nxt = run_recipe["steps"][run_step_index + 1]
-        process_status_label = add_info("STAP KLAAR", 18, GREEN)
-        add_info(f"Volgende   {nxt['name']}   {format_time(nxt['seconds'])}", 15, MUTED)
+        process_status_label = add_info("STEP DONE", 18, GREEN)
+        add_info(f"Next   {nxt['name']}   {format_time(nxt['seconds'])}", 15, MUTED)
         parent = begin_rows()
         set_navigation([
-            add_row(parent, "VOLGENDE STAP", next_process_step),
+            add_row(parent, "NEXT STEP", next_process_step),
             add_row(parent, "STOP", stop_process),
         ])
     else:
-        process_status_label = add_info("PROCES KLAAR", 18, ACCENT)
+        process_status_label = add_info("PROCESS DONE", 18, ACCENT)
         parent = begin_rows()
         set_navigation([
-            add_row(parent, "KLAAR", show_main_menu),
+            add_row(parent, "DONE", show_main_menu),
         ])
 
 
@@ -1749,7 +1750,7 @@ def edit_run_speed():
     if run_recipe is None:
         return
     open_adjust(
-        "Proces snelheid",
+        "Process speed",
         run_recipe["speed"],
         0,
         100,
@@ -1855,7 +1856,7 @@ def setup_input_hardware():
     except Exception as error:
         ok_button = DummyInputDevice()
         back_button = DummyInputDevice()
-        hardware_error = hardware_error or f"Knoppen: {error}"
+        hardware_error = hardware_error or f"Buttons: {error}"
 
 
 def encoder_ab_state():
@@ -1954,6 +1955,17 @@ def close_app():
         pass
 
 
+def shutdown_pi():
+    close_app()
+    try:
+        subprocess.Popen(["shutdown", "-h", "now"])
+    except Exception:
+        try:
+            subprocess.Popen(["sudo", "-n", "shutdown", "-h", "now"])
+        except Exception:
+            pass
+
+
 def attach_xauthority():
     current = os.environ.get("XAUTHORITY")
     if current and Path(current).is_file():
@@ -2042,12 +2054,12 @@ def prepare_display():
     if relaunch_with_xinit():
         return
     sys.stderr.write(
-        "Geen grafisch scherm gevonden.\n"
-        "Tkinter kan niet op DISPLAY=:0 tekenen omdat daar geen X-server draait.\n"
-        "Dat gebeurt op Raspberry Pi OS Lite en op een Wayland-bureaublad.\n\n"
-        "Eenmalig installeren:\n"
+        "No graphical display found.\n"
+        "Tkinter cannot draw on DISPLAY=:0 because no X server is running there.\n"
+        "That happens on Raspberry Pi OS Lite and on a Wayland desktop.\n\n"
+        "Install once:\n"
         "  sudo apt install xserver-xorg xinit\n\n"
-        "Daarna starten, zonder DISPLAY=:0:\n"
+        "Then start, without DISPLAY=:0:\n"
         "  sudo python3 jobo-motor.py\n"
     )
     raise SystemExit(1)
@@ -2063,9 +2075,9 @@ def create_root():
         if "connect" in message and relaunch_with_xinit():
             return
         sys.stderr.write(
-            "Tkinter kon het scherm niet openen.\n"
+            "Tkinter could not open the display.\n"
             f"{error}\n\n"
-            "Start zonder geforceerd display:\n"
+            "Start without a forced display:\n"
             "  sudo python3 jobo-motor.py\n"
         )
         raise SystemExit(1)
